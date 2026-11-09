@@ -1,0 +1,1409 @@
+diff --git a/csrc/flash_attn/flash_api.cpp b/csrc/flash_attn/flash_api.cpp
+index e830e133425021a29f0600ea4ddea3f388311b34..2795ba09052d5887261893f987c8efaa561e94ed 100644
+--- a/csrc/flash_attn/flash_api.cpp
++++ b/csrc/flash_attn/flash_api.cpp
+@@ -1,6 +1,58 @@
+ #include <torch/extension.h>
++#include <cmath>
++#include <c10/cuda/CUDAException.h>
+ #include "flash.h"
+ #include "static_switch.h"
++#include "d32_pad.h"
++#include <c10/cuda/CUDAGuard.h>
++#include <c10/cuda/CUDAStream.h>
++
++// D32 strategy. Default (V1 behaviour): D32 is zero-padded to a physical D64 and
++// run through the D64 kernels. Build with FLASH_TURING_NATIVE_D32=1 (see setup.py)
++// to compile the native D32 kernels and skip padding entirely.
++#ifdef FLASH_TURING_NATIVE_D32
++static constexpr bool kD32UsePadding = false;
++#else
++static constexpr bool kD32UsePadding = true;
++#endif
++
++// Fail closed before dispatch: HEADDIM_SWITCH has no fallback branch.
++static inline void check_supported_head_size(const int64_t head_size) {
++    TORCH_CHECK(head_size == 32 || head_size == 64 || head_size == 96 || head_size == 128,
++                "Unsupported head dimension ", head_size,
++                ". Supported dimensions are 32, 64, 96, and 128.");
++}
++
++static inline void check_fp16_cuda_contiguous(
++        const at::Tensor& tensor, const char* name, const at::Tensor& reference) {
++    TORCH_CHECK(tensor.is_cuda(), name, " must be a CUDA tensor");
++    TORCH_CHECK(tensor.device() == reference.device(), name, " must be on the same CUDA device as q");
++    TORCH_CHECK(tensor.scalar_type() == at::kHalf, name, " must have dtype float16");
++    TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
++}
++
++static inline void check_fp32_cuda_contiguous(
++        const at::Tensor& tensor, const char* name, const at::Tensor& reference) {
++    TORCH_CHECK(tensor.is_cuda(), name, " must be a CUDA tensor");
++    TORCH_CHECK(tensor.device() == reference.device(), name, " must be on the same CUDA device as q");
++    TORCH_CHECK(tensor.scalar_type() == at::kFloat, name, " must have dtype float32");
++    TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
++}
++
++static inline void check_cuda_int32_contiguous(
++        const at::Tensor& tensor, const char* name, const at::Tensor& reference) {
++    TORCH_CHECK(tensor.is_cuda(), name, " must be a CUDA tensor");
++    TORCH_CHECK(tensor.device() == reference.device(), name, " must be on the same CUDA device as q");
++    TORCH_CHECK(tensor.scalar_type() == at::kInt, name, " must have dtype int32");
++    TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
++}
++
++static inline void check_softmax_scale(const float softmax_scale) {
++#ifdef FLASH_TURING_FASTSM
++    TORCH_CHECK(std::isfinite(softmax_scale) && softmax_scale > 0.0f,
++                "FLASH_TURING_FASTSM requires a finite softmax_scale > 0");
++#endif
++}
+ 
+ // D32 compatibility path: materialize a contiguous D64 tensor with the upper
+ // 32 channels zero-filled. The original logical softmax scale is kept by the
+@@ -8,10 +60,19 @@
+ static inline at::Tensor pad_head_dim_32_to_64(const at::Tensor& input) {
+     TORCH_CHECK(input.dim() >= 1 && input.size(-1) == 32,
+                 "D32 padding helper expects last dimension == 32");
+-    std::vector<int64_t> padded_sizes(input.sizes().begin(), input.sizes().end());
++    TORCH_CHECK(input.is_cuda() && input.scalar_type() == at::kHalf,
++                "D32 padding helper expects a CUDA fp16 tensor");
++    at::Tensor src = input.is_contiguous() ? input : input.contiguous();
++    if (reinterpret_cast<uintptr_t>(src.data_ptr()) % 16 != 0) {
++        src = src.clone(at::MemoryFormat::Contiguous);
++    }
++    std::vector<int64_t> padded_sizes(src.sizes().begin(), src.sizes().end());
+     padded_sizes.back() = 64;
+-    at::Tensor padded = torch::zeros(padded_sizes, input.options());
+-    padded.narrow(input.dim() - 1, 0, 32).copy_(input);
++    at::Tensor padded = torch::empty(padded_sizes, src.options());  // fully written by the kernel below
++    c10::cuda::CUDAGuard device_guard(src.device());
++    launch_pad_d32_to_d64(src.data_ptr(), padded.data_ptr(), src.numel() / 32,
++                          c10::cuda::getCurrentCUDAStream().stream());
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
+     return padded;
+ }
+ 
+@@ -19,9 +80,22 @@ static inline void copy_head_dim_64_to_32(at::Tensor& output,
+                                            const at::Tensor& padded) {
+     TORCH_CHECK(output.size(-1) == 32 && padded.size(-1) == 64,
+                 "D32 copy-back expects output D32 and kernel tensor D64");
+-    output.copy_(padded.narrow(padded.dim() - 1, 0, 32));
++    TORCH_CHECK(output.is_cuda() && padded.is_cuda() &&
++                output.scalar_type() == at::kHalf && padded.scalar_type() == at::kHalf,
++                "D32 copy-back expects CUDA fp16 tensors");
++    if (output.is_contiguous() && padded.is_contiguous() &&
++        reinterpret_cast<uintptr_t>(output.data_ptr()) % 16 == 0 &&
++        reinterpret_cast<uintptr_t>(padded.data_ptr()) % 16 == 0) {
++        c10::cuda::CUDAGuard device_guard(output.device());
++        launch_unpad_d64_to_d32(padded.data_ptr(), output.data_ptr(), output.numel() / 32,
++                                c10::cuda::getCurrentCUDAStream().stream());
++        C10_CUDA_KERNEL_LAUNCH_CHECK();
++    } else {
++        output.copy_(padded.narrow(padded.dim() - 1, 0, 32));  // generic fallback
++    }
+ }
+ 
++
+ void set_params_fprop(Flash_fwd_params &params,
+                       // sizes
+                       const size_t b,
+@@ -206,20 +280,39 @@ mha_fwd(at::Tensor q,
+     TORCH_CHECK(v.size(2) == num_heads_k, "k and v num_heads must match");
+     TORCH_CHECK(k.size(3) == head_size && v.size(3) == head_size, "q/k/v head_dim must match");
+     TORCH_CHECK(num_heads % num_heads_k == 0, "num_heads_q must be divisible by num_heads_k for GQA/MQA");
+-
+-    const bool use_d32_padding = (head_size == 32);
++    check_supported_head_size(head_size);
++    check_fp16_cuda_contiguous(q, "q", q);
++    check_fp16_cuda_contiguous(k, "k", q);
++    check_fp16_cuda_contiguous(v, "v", q);
++    c10::cuda::CUDAGuard device_guard(q.device());
++    check_softmax_scale(softmax_scale);
++
++    const bool use_d32_padding = (kD32UsePadding && head_size == 32);
+     const int kernel_head_size = use_d32_padding ? 64 : head_size;
+     at::Tensor q_kernel = use_d32_padding ? pad_head_dim_32_to_64(q) : q;
+     at::Tensor k_kernel = use_d32_padding ? pad_head_dim_32_to_64(k) : k;
+     at::Tensor v_kernel = use_d32_padding ? pad_head_dim_32_to_64(v) : v;
+ 
+-    at::Tensor o = torch::zeros(q.sizes(), q.options().dtype(torch::kFloat16));
++    // V2: o / l are fully written by the kernel except when whole query rows never run:
++    // causal with seqlen_q > seqlen_k (blocks that exit early), or empty sequences.
++    // Only then do we pay for the zero-fill memsets (2 fewer GPU ops per call otherwise).
++    const bool fwd_needs_zero_fill = (seqlen_q == 0 || seqlen_k == 0 ||
++                                      (is_causal && seqlen_q > seqlen_k));
++    auto fwd_alloc = [&](at::IntArrayRef shape, at::ScalarType dt) {
++        return fwd_needs_zero_fill
++            ? torch::zeros(shape, q.options().dtype(dt))
++            : torch::empty(shape, q.options().dtype(dt));
++    };
++
++    at::Tensor o = use_d32_padding
++        ? torch::empty(q.sizes(), q.options().dtype(torch::kFloat16))  // fully overwritten by copy-back
++        : fwd_alloc(q.sizes(), torch::kFloat16);
+     at::Tensor o_kernel = use_d32_padding
+-        ? torch::zeros(q_kernel.sizes(), q.options().dtype(torch::kFloat16))
++        ? fwd_alloc(q_kernel.sizes(), torch::kFloat16)
+         : o;
+ 
+     std::vector<int64_t> size = {batch_size, num_heads, seqlen_q};
+-    at::Tensor l = torch::zeros(size, q.options().dtype(torch::kFloat32).device(device));
++    at::Tensor l = fwd_alloc(size, torch::kFloat32);
+ 
+     TORCH_CHECK(o.is_cuda(), "Tensor o is not on CUDA");
+ 
+@@ -296,8 +389,17 @@ mha_bwd(at::Tensor q,
+     TORCH_CHECK(k.size(3) == head_size && v.size(3) == head_size, "q/k/v head_dim must match");
+     TORCH_CHECK(out.sizes() == q.sizes() && dout.sizes() == q.sizes(), "out and dout must match q shape");
+     TORCH_CHECK(num_heads % num_heads_k == 0, "num_heads_q must be divisible by num_heads_k for GQA/MQA");
+-
+-    const bool use_d32_padding = (head_size == 32);
++    check_supported_head_size(head_size);
++    check_fp16_cuda_contiguous(q, "q", q);
++    check_fp16_cuda_contiguous(k, "k", q);
++    check_fp16_cuda_contiguous(v, "v", q);
++    check_fp16_cuda_contiguous(out, "out", q);
++    check_fp16_cuda_contiguous(dout, "dout", q);
++    check_fp32_cuda_contiguous(l, "lse", q);
++    c10::cuda::CUDAGuard device_guard(q.device());
++    check_softmax_scale(softmax_scale);
++
++    const bool use_d32_padding = (kD32UsePadding && head_size == 32);
+     const int kernel_head_size = use_d32_padding ? 64 : head_size;
+     at::Tensor q_kernel = use_d32_padding ? pad_head_dim_32_to_64(q) : q;
+     at::Tensor k_kernel = use_d32_padding ? pad_head_dim_32_to_64(k) : k;
+@@ -305,9 +407,15 @@ mha_bwd(at::Tensor q,
+     at::Tensor out_kernel = use_d32_padding ? pad_head_dim_32_to_64(out) : out;
+     at::Tensor dout_kernel = use_d32_padding ? pad_head_dim_32_to_64(dout) : dout;
+ 
+-    at::Tensor dq = torch::zeros(q.sizes(), q.options().dtype(torch::kFloat16));
+-    at::Tensor dk = torch::zeros(k.sizes(), k.options().dtype(torch::kFloat16));
+-    at::Tensor dv = torch::zeros(v.sizes(), v.options().dtype(torch::kFloat16));
++    at::Tensor dq = use_d32_padding
++        ? torch::empty(q.sizes(), q.options().dtype(torch::kFloat16))  // fully overwritten by copy-back
++        : torch::zeros(q.sizes(), q.options().dtype(torch::kFloat16));
++    at::Tensor dk = use_d32_padding
++        ? torch::empty(k.sizes(), k.options().dtype(torch::kFloat16))  // fully overwritten by copy-back
++        : torch::zeros(k.sizes(), k.options().dtype(torch::kFloat16));
++    at::Tensor dv = use_d32_padding
++        ? torch::empty(v.sizes(), v.options().dtype(torch::kFloat16))  // fully overwritten by copy-back
++        : torch::zeros(v.sizes(), v.options().dtype(torch::kFloat16));
+ 
+     at::Tensor dq_kernel = use_d32_padding
+         ? torch::zeros(q_kernel.sizes(), q.options().dtype(torch::kFloat16))
+@@ -412,8 +520,16 @@ mha_varlen_fwd(at::Tensor q,
+     const int num_heads = q.size(1);
+     const int num_heads_k = k.size(1);
+     const int head_size = q.size(2);
+-
+-    const bool use_d32_padding = (head_size == 32);
++    check_supported_head_size(head_size);
++    check_fp16_cuda_contiguous(q, "q", q);
++    check_fp16_cuda_contiguous(k, "k", q);
++    check_fp16_cuda_contiguous(v, "v", q);
++    check_cuda_int32_contiguous(cu_seqlens_q, "cu_seqlens_q", q);
++    check_cuda_int32_contiguous(cu_seqlens_k, "cu_seqlens_k", q);
++    c10::cuda::CUDAGuard device_guard(q.device());
++    check_softmax_scale(softmax_scale);
++
++    const bool use_d32_padding = (kD32UsePadding && head_size == 32);
+     const int kernel_head_size = use_d32_padding ? 64 : head_size;
+     at::Tensor q_kernel = use_d32_padding ? pad_head_dim_32_to_64(q) : q;
+     at::Tensor k_kernel = use_d32_padding ? pad_head_dim_32_to_64(k) : k;
+@@ -501,8 +617,19 @@ mha_varlen_bwd(at::Tensor q,
+     const int64_t total_k = k.size(0);
+     TORCH_CHECK(l.size(0) == batch_size && l.size(1) == num_heads && l.size(2) == max_seqlen_q,
+                 "l must have shape [batch_size, nheads_q, max_seqlen_q]");
+-
+-    const bool use_d32_padding = (head_size == 32);
++    check_supported_head_size(head_size);
++    check_fp16_cuda_contiguous(q, "q", q);
++    check_fp16_cuda_contiguous(k, "k", q);
++    check_fp16_cuda_contiguous(v, "v", q);
++    check_fp16_cuda_contiguous(out, "out", q);
++    check_fp16_cuda_contiguous(dout, "dout", q);
++    check_fp32_cuda_contiguous(l, "lse", q);
++    check_cuda_int32_contiguous(cu_seqlens_q, "cu_seqlens_q", q);
++    check_cuda_int32_contiguous(cu_seqlens_k, "cu_seqlens_k", q);
++    c10::cuda::CUDAGuard device_guard(q.device());
++    check_softmax_scale(softmax_scale);
++
++    const bool use_d32_padding = (kD32UsePadding && head_size == 32);
+     const int64_t kernel_head_size = use_d32_padding ? 64 : head_size;
+     at::Tensor q_kernel = use_d32_padding ? pad_head_dim_32_to_64(q) : q;
+     at::Tensor k_kernel = use_d32_padding ? pad_head_dim_32_to_64(k) : k;
+@@ -510,9 +637,9 @@ mha_varlen_bwd(at::Tensor q,
+     at::Tensor out_kernel = use_d32_padding ? pad_head_dim_32_to_64(out) : out;
+     at::Tensor dout_kernel = use_d32_padding ? pad_head_dim_32_to_64(dout) : dout;
+ 
+-    at::Tensor dq = torch::zeros_like(q);
+-    at::Tensor dk = torch::zeros_like(k);
+-    at::Tensor dv = torch::zeros_like(v);
++    at::Tensor dq = use_d32_padding ? torch::empty_like(q) : torch::zeros_like(q);
++    at::Tensor dk = use_d32_padding ? torch::empty_like(k) : torch::zeros_like(k);
++    at::Tensor dv = use_d32_padding ? torch::empty_like(v) : torch::zeros_like(v);
+     at::Tensor dq_kernel = use_d32_padding
+         ? torch::zeros(q_kernel.sizes(), q.options().dtype(torch::kFloat16))
+         : dq;
+diff --git a/csrc/flash_attn/src/d32_pad.h b/csrc/flash_attn/src/d32_pad.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..8f76c8aef3c675c4bd26253f6755026fbd89be68
+--- /dev/null
++++ b/csrc/flash_attn/src/d32_pad.h
+@@ -0,0 +1,11 @@
++#pragma once
++#include <cstdint>
++#include <cuda_runtime.h>
++
++// Fused D32 <-> D64 helpers (fp16 only). One kernel launch each, replacing the
++// zeros() + narrow().copy_() / narrow-copy-back sequence of the V1 padding path.
++//   pad:   src [rows, 32] -> dst [rows, 64]   (upper 32 channels written as 0)
++//   unpad: src [rows, 64] -> dst [rows, 32]
++// All pointers must be 16-byte aligned and densely packed (contiguous).
++void launch_pad_d32_to_d64(const void* src, void* dst, int64_t rows, cudaStream_t stream);
++void launch_unpad_d64_to_d32(const void* src, void* dst, int64_t rows, cudaStream_t stream);
+diff --git a/csrc/flash_attn/src/d32_pad_sm75.cu b/csrc/flash_attn/src/d32_pad_sm75.cu
+new file mode 100644
+index 0000000000000000000000000000000000000000..f2ae76c6e105eb1d942be7a342af3cc514638504
+--- /dev/null
++++ b/csrc/flash_attn/src/d32_pad_sm75.cu
+@@ -0,0 +1,53 @@
++#include "d32_pad.h"
++
++namespace {
++
++constexpr int kThreads = 256;
++
++// Row of 32 halves = 4 x uint4 (16 B). Row of 64 halves = 8 x uint4.
++__global__ void pad_d32_to_d64_kernel(const uint4* __restrict__ src,
++                                      uint4* __restrict__ dst,
++                                      int64_t rows) {
++    const int64_t n = rows * 4;
++    const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
++    for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += stride) {
++        const int64_t r = i >> 2;
++        const int c = static_cast<int>(i & 3);
++        dst[r * 8 + c] = src[i];
++        dst[r * 8 + 4 + c] = make_uint4(0u, 0u, 0u, 0u);
++    }
++}
++
++__global__ void unpad_d64_to_d32_kernel(const uint4* __restrict__ src,
++                                        uint4* __restrict__ dst,
++                                        int64_t rows) {
++    const int64_t n = rows * 4;
++    const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
++    for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += stride) {
++        const int64_t r = i >> 2;
++        const int c = static_cast<int>(i & 3);
++        dst[i] = src[r * 8 + c];
++    }
++}
++
++inline int num_blocks(int64_t rows) {
++    const int64_t n = rows * 4;
++    int64_t b = (n + kThreads - 1) / kThreads;
++    if (b < 1) b = 1;
++    if (b > 65535) b = 65535;  // grid-stride loop handles the rest
++    return static_cast<int>(b);
++}
++
++}  // namespace
++
++void launch_pad_d32_to_d64(const void* src, void* dst, int64_t rows, cudaStream_t stream) {
++    if (rows <= 0) return;
++    pad_d32_to_d64_kernel<<<num_blocks(rows), kThreads, 0, stream>>>(
++        static_cast<const uint4*>(src), static_cast<uint4*>(dst), rows);
++}
++
++void launch_unpad_d64_to_d32(const void* src, void* dst, int64_t rows, cudaStream_t stream) {
++    if (rows <= 0) return;
++    unpad_d64_to_d32_kernel<<<num_blocks(rows), kThreads, 0, stream>>>(
++        static_cast<const uint4*>(src), static_cast<uint4*>(dst), rows);
++}
+diff --git a/csrc/flash_attn/src/flash_bwd_hdim32_fp16_causal_sm75.cu b/csrc/flash_attn/src/flash_bwd_hdim32_fp16_causal_sm75.cu
+new file mode 100644
+index 0000000000000000000000000000000000000000..74d42086e8a0e4557d77824991cd1db4329ab67e
+--- /dev/null
++++ b/csrc/flash_attn/src/flash_bwd_hdim32_fp16_causal_sm75.cu
+@@ -0,0 +1,10 @@
++#include "flash_bwd_launch_template.h"
++
++#include <cutlass/numeric_types.h>
++
++using half_t = cutlass::half_t;
++
++template<>
++void run_mha_bwd_<32, true>(Flash_bwd_params &params) {
++    run_mha_bwd_hdim32<true>(params);
++}
+diff --git a/csrc/flash_attn/src/flash_bwd_hdim32_fp16_sm75.cu b/csrc/flash_attn/src/flash_bwd_hdim32_fp16_sm75.cu
+new file mode 100644
+index 0000000000000000000000000000000000000000..0ef60db03a97949720850a17791b49f8eb47739b
+--- /dev/null
++++ b/csrc/flash_attn/src/flash_bwd_hdim32_fp16_sm75.cu
+@@ -0,0 +1,10 @@
++#include "flash_bwd_launch_template.h"
++
++#include <cutlass/numeric_types.h>
++
++using half_t = cutlass::half_t;
++
++template<>
++void run_mha_bwd_<32, false>(Flash_bwd_params &params) {
++    run_mha_bwd_hdim32<false>(params);
++}
+diff --git a/csrc/flash_attn/src/flash_bwd_launch_template.h b/csrc/flash_attn/src/flash_bwd_launch_template.h
+index f278bf30203ed3556e584c84fb3d9621c8d4fde2..1abefdeaa329095237a5c5c8eaf03732103ff11d 100644
+--- a/csrc/flash_attn/src/flash_bwd_launch_template.h
++++ b/csrc/flash_attn/src/flash_bwd_launch_template.h
+@@ -1,11 +1,13 @@
+ 
+ #pragma once
++#include <c10/cuda/CUDAException.h>
+ #include <c10/cuda/CUDAStream.h>
+ #include "flash.h"
+ #include "flash_bwd_kernel.h"
+ #include "flash_bwd_preprocess_kernel.h"
+ #include "static_switch.h"
+ #include <cutlass/numeric_types.h>
++#include <atomic>
+ using half_t = cutlass::half_t;
+ 
+ 
+@@ -90,6 +92,7 @@ void run_flash_bwd(Flash_bwd_params &params) {
+                     params.do_o_ptr,
+                     params.cu_seqlens_q,
+                     params.b, params.seqlen_q, params.h, params.d, params.is_causal);
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
+ 
+ 
+     int maxbytes = 65536;
+@@ -102,8 +105,17 @@ void run_flash_bwd(Flash_bwd_params &params) {
+     dim3 dimBlock_dq(256);
+ 
+     //auto dq_kernel = flash_bwd_dk_dv_kernel<Kernel_traits, Is_causal>;
++    int dev = 0;
++    C10_CUDA_CHECK(cudaGetDevice(&dev));
++
+     BOOL_SWITCH(is_even_MN, Is_even_MN, [&] {
+-    cudaFuncSetAttribute(flash_bwd_dq_kernel<Kernel_traits, Is_causal, Is_even_MN>, cudaFuncAttributeMaxDynamicSharedMemorySize, maxbytes);
++    static std::atomic<bool> dq_attr_set[16];   // once per (kernel, device), not per launch
++    if (dev < 0 || dev >= 16 || !dq_attr_set[dev].load(std::memory_order_relaxed)) {
++        C10_CUDA_CHECK(cudaFuncSetAttribute(
++            flash_bwd_dq_kernel<Kernel_traits, Is_causal, Is_even_MN>,
++            cudaFuncAttributeMaxDynamicSharedMemorySize, maxbytes));
++        if (dev >= 0 && dev < 16) dq_attr_set[dev].store(true, std::memory_order_relaxed);
++    }
+     flash_bwd_dq_kernel<Kernel_traits, Is_causal, Is_even_MN><<<dimGrid_dq, dimBlock_dq, maxbytes, stream>>>(params.q_ptr,
+                                             params.k_ptr,
+                                             params.v_ptr,
+@@ -114,6 +126,7 @@ void run_flash_bwd(Flash_bwd_params &params) {
+                                             params.cu_seqlens_q,
+                                             params.cu_seqlens_k,
+                                             params.b, params.seqlen_q, params.seqlen_k, params.h, params.h_k, params.h_h_k_ratio, params.d, params.softmax_scale, params.is_causal);
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
+     });
+ 
+ 
+@@ -125,7 +138,13 @@ void run_flash_bwd(Flash_bwd_params &params) {
+ 
+      BOOL_SWITCH(is_even_MN, Is_even_MN, [&] {
+          //auto dk_dv_kernel = flash_bwd_dk_dv_kernel<Kernel_traits, Is_causal>;
+-         cudaFuncSetAttribute(flash_bwd_dk_dv_kernel<Kernel_traits, Is_causal, Is_even_MN>, cudaFuncAttributeMaxDynamicSharedMemorySize, maxbytes);
++         static std::atomic<bool> dkdv_attr_set[16];
++         if (dev < 0 || dev >= 16 || !dkdv_attr_set[dev].load(std::memory_order_relaxed)) {
++             C10_CUDA_CHECK(cudaFuncSetAttribute(
++                 flash_bwd_dk_dv_kernel<Kernel_traits, Is_causal, Is_even_MN>,
++                 cudaFuncAttributeMaxDynamicSharedMemorySize, maxbytes));
++             if (dev >= 0 && dev < 16) dkdv_attr_set[dev].store(true, std::memory_order_relaxed);
++         }
+          flash_bwd_dk_dv_kernel<Kernel_traits, Is_causal, Is_even_MN><<<dimGrid_dk_dv, dimBlock_dk_dv, maxbytes, stream>>>(params.q_ptr,
+                                                  params.k_ptr,
+                                                  params.v_ptr,
+@@ -137,6 +156,7 @@ void run_flash_bwd(Flash_bwd_params &params) {
+                                                  params.cu_seqlens_q,
+                                                  params.cu_seqlens_k,
+                                                  params.b, params.seqlen_q, params.seqlen_k, params.h, params.h_k, params.h_h_k_ratio, params.d, params.softmax_scale, params.is_causal);
++         C10_CUDA_KERNEL_LAUNCH_CHECK();
+      });
+ 
+      
+@@ -145,6 +165,17 @@ void run_flash_bwd(Flash_bwd_params &params) {
+ 
+ 
+ 
++}
++
++
++template<bool Is_causal>
++void run_mha_bwd_hdim32(Flash_bwd_params &params) {
++    constexpr static int Headdim = 32;
++    constexpr static int kBlockM = 64;
++    constexpr static int kBlockN = 64;
++    constexpr static int kNWarps = 8;
++
++    run_flash_bwd<Flash_bwd_kernel_traits<Headdim, kBlockM, kBlockN, kNWarps>, Is_causal>(params);
+ }
+ 
+ 
+diff --git a/csrc/flash_attn/src/flash_bwd_preprocess_kernel.h b/csrc/flash_attn/src/flash_bwd_preprocess_kernel.h
+index 16ad9ace01c8b47d373e15e46a8b6ff596680661..877dfd1cd6295e9be930acf5abae5f28b10e5a97 100644
+--- a/csrc/flash_attn/src/flash_bwd_preprocess_kernel.h
++++ b/csrc/flash_attn/src/flash_bwd_preprocess_kernel.h
+@@ -61,7 +61,9 @@ inline __device__ void compute_dot_do_o(half_t* o_ptr,
+     // for headdim = 128, each thread computes 4 elements
+     constexpr int kHeadDim = Kernel_traits::kHeadDim;
+     int elements_per_thread = 0;
+-    if constexpr (kHeadDim == 64) {
++    if constexpr (kHeadDim == 32) {
++        elements_per_thread = 1;   // 32 lanes x 1 element = one 32-wide row
++    } else if constexpr (kHeadDim == 64) {
+         elements_per_thread = 2;
+     } else if constexpr (kHeadDim == 96) {
+         elements_per_thread = 3;
+diff --git a/csrc/flash_attn/src/flash_fwd_hdim32_fp16_causal_sm75.cu b/csrc/flash_attn/src/flash_fwd_hdim32_fp16_causal_sm75.cu
+new file mode 100644
+index 0000000000000000000000000000000000000000..1e591f26fd1a7176c46abd8580d862f59b186d38
+--- /dev/null
++++ b/csrc/flash_attn/src/flash_fwd_hdim32_fp16_causal_sm75.cu
+@@ -0,0 +1,10 @@
++#include "flash_fwd_launch_template.h"
++
++#include <cutlass/numeric_types.h>
++
++using half_t = cutlass::half_t;
++
++template<>
++void run_mha_fwd_<32, true>(Flash_fwd_params &params) {
++    run_mha_fwd_hdim32<true>(params);
++}
+diff --git a/csrc/flash_attn/src/flash_fwd_hdim32_fp16_sm75.cu b/csrc/flash_attn/src/flash_fwd_hdim32_fp16_sm75.cu
+new file mode 100644
+index 0000000000000000000000000000000000000000..42fd53755f51a4160d6e12386771228f92891571
+--- /dev/null
++++ b/csrc/flash_attn/src/flash_fwd_hdim32_fp16_sm75.cu
+@@ -0,0 +1,10 @@
++#include "flash_fwd_launch_template.h"
++
++#include <cutlass/numeric_types.h>
++
++using half_t = cutlass::half_t;
++
++template<>
++void run_mha_fwd_<32, false>(Flash_fwd_params &params) {
++    run_mha_fwd_hdim32<false>(params);
++}
+diff --git a/csrc/flash_attn/src/flash_fwd_kernel.h b/csrc/flash_attn/src/flash_fwd_kernel.h
+index 8f66022e29312c1b5ef8f42030a7319924a52021..01bd839e6399030ac82286257cf8401d991afc38 100644
+--- a/csrc/flash_attn/src/flash_fwd_kernel.h
++++ b/csrc/flash_attn/src/flash_fwd_kernel.h
+@@ -18,6 +18,25 @@
+ 
+ using namespace cute;
+ 
++// ---------------------------------------------------------------------------
++// Opt-in forward-kernel variants (see README_V2.md). With neither macro defined
++// this file compiles to exactly the V1 behaviour.
++//   FLASH_TURING_SEPV   separate smem buffer for V + V staged through registers
++//                       (hides V's global-load latency behind QK^T, 2 fewer
++//                       __syncthreads per KV iteration). Needs
++//                       (kBlockM + 2*kBlockN) * kHeadDim * 2 bytes of smem.
++//   FLASH_TURING_FASTSM softmax in the exp2 domain without the separate
++//                       S *= scale pass. Requires softmax_scale > 0.
++// ---------------------------------------------------------------------------
++#ifdef FLASH_TURING_FASTSM
++  // exp(scale * d) == exp2(d * scale * log2(e)); d <= 0 here.
++  #define FT_EXP(d)        exp2f((d) * scale_log2)
++  #define FT_LSE_M(m)      ((m) * softmax_scale)
++#else
++  #define FT_EXP(d)        expf(d)
++  #define FT_LSE_M(m)      (m)
++#endif
++
+ 
+ // for some reason changing this into params struct is 15% slower for hdim = 128
+ template <typename Kernel_traits, bool Is_causal, bool Is_even_MN>
+@@ -107,8 +126,14 @@ inline __device__ void compute_attn_1rowblock(
+ 
+     Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<half_t*>(&smem_[0])), typename Kernel_traits::SmemLayoutQ{});
+     Tensor sK = make_tensor(sQ.data() + kBlockM*kHeadDim, typename Kernel_traits::SmemLayoutK{});
++#ifdef FLASH_TURING_SEPV
++    // Q | K | V, no aliasing between K and V
++    Tensor sV = make_tensor(sK.data() + kBlockN*kHeadDim, typename Kernel_traits::SmemLayoutV{});
++    Tensor sVt = make_tensor(sV.data(), typename Kernel_traits::SmemLayoutVTransposed{});
++#else
+     Tensor sV = make_tensor(sK.data(), typename Kernel_traits::SmemLayoutV{});
+     Tensor sVt = make_tensor(sK.data(), typename Kernel_traits::SmemLayoutVTransposed{});
++#endif
+     Tensor sO = make_tensor(make_smem_ptr(reinterpret_cast<half_t*>(&smem_[0])), typename Kernel_traits::SmemLayoutQ{});
+ 
+ 
+@@ -118,6 +143,9 @@ inline __device__ void compute_attn_1rowblock(
+     const int thread_row = warp_id * 16 + lane_id / 4;
+     const int global_row_offset = m_block * kBlockM;
+ 
++#ifdef FLASH_TURING_FASTSM
++    const float scale_log2 = softmax_scale * 1.4426950408889634f;
++#endif
+     float rM_old[2] = {-FLT_MAX, -FLT_MAX};
+     float rM[2] = {0.0f};
+     float rL_old[2] = {0.0f};
+@@ -283,6 +311,14 @@ inline __device__ void compute_attn_1rowblock(
+ 
+         clear(tSrS_float);
+ 
++#ifdef FLASH_TURING_SEPV
++        // V(n): global -> registers now (latency hidden behind the QK^T MMAs below)
++        masked_copy<Is_even_MN>(
++            gmem_tiled_copy_QK, tVgV(_,_,_,n_block), tVrV, tCqK,
++            seqlen_k - n_block * kBlockN,
++            /*clear_D=*/true);
++#endif
++
+         // if (n_block + 1 < n_block_max) {
+         //     copy(gmem_tiled_copy_QK, tKgK(_,_,_,n_block + 1), tKrK);
+         // }
+@@ -306,6 +342,10 @@ inline __device__ void compute_attn_1rowblock(
+ 
+         }
+ 
++#ifdef FLASH_TURING_SEPV
++        copy(gmem_tiled_copy_V, tVrV, tVsV);   // registers -> sV (own buffer)
++        __syncthreads();
++#else
+         __syncthreads();
+         masked_copy<Is_even_MN>(
+             gmem_tiled_copy_QK, tVgV(_,_,_,n_block), tVsV, tCqK, 
+@@ -314,12 +354,15 @@ inline __device__ void compute_attn_1rowblock(
+ 
+         // copy(gmem_tiled_copy_V, tVgV(_,_,_,n_block), tVsV);
+         __syncthreads();
++#endif
+ 
+ 
++#ifndef FLASH_TURING_FASTSM
+         // for now we rescale before we apply causal mask
+         for (int i=0;i< tSrS_float.size();i ++ ) {
+             tSrS_float[i] *= softmax_scale;
+         }
++#endif
+ 
+    
+         accum_s_mask.template apply_mask_fwd<Is_causal, Is_even_MN>(
+@@ -370,7 +413,7 @@ inline __device__ void compute_attn_1rowblock(
+                 if (rM[i] == -FLT_MAX) {
+                     tSrS_float(make_coord(_,i),_,_)[j] = 0.0f;
+                 } else {
+-                    tSrS_float(make_coord(_,i),_,_)[j] = expf(tSrS_float(make_coord(_,i),_,_)[j] - rM[i]);
++                    tSrS_float(make_coord(_,i),_,_)[j] = FT_EXP(tSrS_float(make_coord(_,i),_,_)[j] - rM[i]);
+                 }
+ 
+             }
+@@ -380,7 +423,7 @@ inline __device__ void compute_attn_1rowblock(
+ 
+         // rescale l and also reset rD to 0
+         for (int i =0; i<2; i++) {
+-            rL[i] = expf(rM_old[i] - rM[i]) * rL_old[i];
++            rL[i] = FT_EXP(rM_old[i] - rM[i]) * rL_old[i];
+             rD[i] = 0.0f;
+         }
+         // compute sum(sP)
+@@ -425,7 +468,7 @@ inline __device__ void compute_attn_1rowblock(
+ 
+         for (int i =0; i<2; i++) {
+             for (int j=0; j < tOrO_float(make_coord(_,i),_,_).size(); j++) {
+-                tOrO_float(make_coord(_,i),_,_)[j] = expf(rM_old[i] - rM[i]) * tOrO_float(make_coord(_,i),_,_)[j];
++                tOrO_float(make_coord(_,i),_,_)[j] = FT_EXP(rM_old[i] - rM[i]) * tOrO_float(make_coord(_,i),_,_)[j];
+             }
+         }
+ 
+@@ -445,7 +488,10 @@ inline __device__ void compute_attn_1rowblock(
+             rL_old[i] = rL[i];
+         }
+ 
++#ifndef FLASH_TURING_SEPV
++        // (SEPV: K and V live in different buffers, so the next K store cannot race with PV)
+         __syncthreads();
++#endif
+ 
+     }
+ 
+@@ -467,6 +513,10 @@ inline __device__ void compute_attn_1rowblock(
+ 
+         clear(tSrS_float);
+ 
++#ifdef FLASH_TURING_SEPV
++        copy(gmem_tiled_copy_V, tVgV(_,_,_,n_block), tVrV);   // global -> registers
++#endif
++
+         // if (n_block + 1 < n_block_no_mask) {
+         //     copy(gmem_tiled_copy_QK, tKgK(_,_,_,n_block + 1), tKrK);
+         //     //copy(gmem_tiled_copy_V, tVgV(_,_,_,kv_tile + 1), tVrV);
+@@ -486,15 +536,21 @@ inline __device__ void compute_attn_1rowblock(
+ 
+         }
+ 
++#ifdef FLASH_TURING_SEPV
++        copy(gmem_tiled_copy_V, tVrV, tVsV);   // registers -> sV (own buffer)
++        __syncthreads();
++#else
+         __syncthreads();
+         copy(gmem_tiled_copy_V, tVgV(_,_,_,n_block), tVsV);
+         __syncthreads();
++#endif
+ 
+ 
+-
++#ifndef FLASH_TURING_FASTSM
+         for (int i=0;i< tSrS_float.size();i ++ ) {
+             tSrS_float[i] *= softmax_scale;
+         }
++#endif
+ 
+ 
+ 
+@@ -534,12 +590,12 @@ inline __device__ void compute_attn_1rowblock(
+             //float max_scaled = rM[i] * float(M_LOG2E);
+             CUTE_UNROLL
+             for (int j=0; j < tSrS_float(make_coord(_,i),_,_).size(); j++) {
+-                tSrS_float(make_coord(_,i),_,_)[j] = expf(tSrS_float(make_coord(_,i),_,_)[j] - rM[i]);
++                tSrS_float(make_coord(_,i),_,_)[j] = FT_EXP(tSrS_float(make_coord(_,i),_,_)[j] - rM[i]);
+                 // using FMA instructions inside exp is slower
+                 //tSrS_float(make_coord(_,i),_,_)[j] = exp2f(tSrS_float(make_coord(_,i),_,_)[j] * float(M_LOG2E) - max_scaled);
+             }
+             
+-            rL[i] = expf(rM_old[i] - rM[i]) * rL_old[i];
++            rL[i] = FT_EXP(rM_old[i] - rM[i]) * rL_old[i];
+             // rL[i] = exp2f(rM_old[i] * float(M_LOG2E) - max_scaled) * rL_old[i];
+             rD[i] = 0.0f;
+         }
+@@ -588,7 +644,7 @@ inline __device__ void compute_attn_1rowblock(
+ 
+         for (int i =0; i<2; i++) {
+             for (int j=0; j < tOrO_float(make_coord(_,i),_,_).size(); j++) {
+-                tOrO_float(make_coord(_,i),_,_)[j] = expf(rM_old[i] - rM[i]) * tOrO_float(make_coord(_,i),_,_)[j];
++                tOrO_float(make_coord(_,i),_,_)[j] = FT_EXP(rM_old[i] - rM[i]) * tOrO_float(make_coord(_,i),_,_)[j];
+             }
+         }
+ 
+@@ -611,7 +667,9 @@ inline __device__ void compute_attn_1rowblock(
+         }
+ 
+ 
++#ifndef FLASH_TURING_SEPV
+         __syncthreads();
++#endif
+ 
+     }
+     // end of KV loop
+@@ -652,7 +710,7 @@ inline __device__ void compute_attn_1rowblock(
+         if (rL[0] == 0.0f) {
+             gL[thread_row] = 0.0f;
+         } else {
+-            gL[thread_row] = rM[0] + logf(rL[0]);
++            gL[thread_row] = FT_LSE_M(rM[0]) + logf(rL[0]);
+         }
+ 
+ 
+@@ -662,7 +720,7 @@ inline __device__ void compute_attn_1rowblock(
+         if (rL[1] == 0.0f) {
+             gL[thread_row + 8] = 0.0f;
+         } else {
+-            gL[thread_row + 8] = rM[1] + logf(rL[1]);
++            gL[thread_row + 8] = FT_LSE_M(rM[1]) + logf(rL[1]);
+         }
+ 
+     }
+diff --git a/csrc/flash_attn/src/flash_fwd_launch_template.h b/csrc/flash_attn/src/flash_fwd_launch_template.h
+index b5cf387394321c78027bf013fe29ae1684104410..e3802c626b19bdee86dd14b01088433fe1c610a1 100644
+--- a/csrc/flash_attn/src/flash_fwd_launch_template.h
++++ b/csrc/flash_attn/src/flash_fwd_launch_template.h
+@@ -1,10 +1,12 @@
+ 
+ #pragma once
++#include <c10/cuda/CUDAException.h>
+ #include <c10/cuda/CUDAStream.h>
+ #include "flash.h"
+ #include "flash_fwd_kernel.h"
+ #include <cutlass/numeric_types.h>
+ #include "static_switch.h"
++#include <atomic>
+ using half_t = cutlass::half_t;
+ 
+ template <typename Kernel_traits, bool Is_causal, bool Is_even_MN>
+@@ -64,11 +66,29 @@ void run_flash_fwd(Flash_fwd_params &params) {
+ 
+     dim3 dimGrid(num_m_block, params.b, params.h);
+     dim3 dimBlock(256);
+-    int maxbytes = 65536;
+ 
++    // Exact dynamic smem: sQ (kBlockM x D) + sK (kBlockN x D) [+ sV (kBlockN x D) with SEPV].
++    // (V1 always requested 64 KB, which pinned occupancy at 1 CTA/SM even for small tiles.)
++#ifdef FLASH_TURING_SEPV
++    constexpr int kSmemTiles = kBlockM + 2 * kBlockN;
++#else
++    constexpr int kSmemTiles = kBlockM + kBlockN;
++#endif
++    constexpr int maxbytes = kSmemTiles * Kernel_traits::kHeadDim * int(sizeof(half_t));
++    static_assert(maxbytes <= 65536, "forward tile does not fit in 64 KB of shared memory on SM75");
++
++    int dev = 0;
++    C10_CUDA_CHECK(cudaGetDevice(&dev));
+ 
+     BOOL_SWITCH(is_even_MN, Is_even_MN, [&] {
+-        cudaFuncSetAttribute(flash_fwd_kernel<Kernel_traits, Is_causal, Is_even_MN>, cudaFuncAttributeMaxDynamicSharedMemorySize, maxbytes);
++        // cudaFuncSetAttribute is a host-side driver call; do it once per (kernel, device), not per launch.
++        static std::atomic<bool> smem_attr_set[16];
++        if (dev < 0 || dev >= 16 || !smem_attr_set[dev].load(std::memory_order_relaxed)) {
++            C10_CUDA_CHECK(cudaFuncSetAttribute(
++                flash_fwd_kernel<Kernel_traits, Is_causal, Is_even_MN>,
++                cudaFuncAttributeMaxDynamicSharedMemorySize, maxbytes));
++            if (dev >= 0 && dev < 16) smem_attr_set[dev].store(true, std::memory_order_relaxed);
++        }
+         flash_fwd_kernel<Kernel_traits, Is_causal, Is_even_MN><<<dimGrid, dimBlock, maxbytes, stream>>>(params.q_ptr,
+                                                                                     params.k_ptr,
+                                                                                     params.v_ptr,
+@@ -85,6 +105,7 @@ void run_flash_fwd(Flash_fwd_params &params) {
+                                                                                     params.d,
+                                                                                     params.softmax_scale,
+                                                                                     params.is_causal);
++        C10_CUDA_KERNEL_LAUNCH_CHECK();
+ 
+     });
+ 
+@@ -92,6 +113,16 @@ void run_flash_fwd(Flash_fwd_params &params) {
+ 
+ 
+ 
++template<bool Is_causal>
++void run_mha_fwd_hdim32(Flash_fwd_params &params) {
++    constexpr static int Headdim = 32;
++    constexpr static int kBlockM = 128;
++    constexpr static int kBlockN = 128;
++    constexpr static int kNWarps = 8;
++    run_flash_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, kNWarps>, Is_causal>(params);
++}
++
++
+ template<bool Is_causal>
+ void run_mha_fwd_hdim128(Flash_fwd_params &params) {
+     constexpr static int Headdim = 128;
+diff --git a/csrc/flash_attn/src/kernel_traits.h b/csrc/flash_attn/src/kernel_traits.h
+index c5cebdc6a069fdabb154088ed43e0c25633dff88..5ff5c17b009a016c9bc5e09dc01bb66db6f06824 100644
+--- a/csrc/flash_attn/src/kernel_traits.h
++++ b/csrc/flash_attn/src/kernel_traits.h
+@@ -9,6 +9,11 @@ using half_t = cutlass::half_t;
+ 
+ using namespace cute;
+ 
++// kHeadDim == 32 reuses the narrow 32-column smem/gmem/LDSM configuration that
++// kHeadDim == 96 already uses (a 96-wide head is three 32-wide atoms; a 32-wide
++// head is exactly one). The configuration below is selected by
++// (kHeadDim == 96 || kHeadDim == 32).
++
+ template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, typename elem_type=cutlass::half_t>
+ struct Flash_kernel_traits {
+ 
+@@ -62,7 +67,7 @@ struct Flash_fwd_kernel_traits : public Base {
+         Tile<_128, _32, _8>>;
+ 
+     using SmemLayoutAtomQK = std::conditional_t<
+-        kHeadDim == 96,
++        (kHeadDim == 96 || kHeadDim == 32),
+         decltype(composition(Swizzle<2, 3, 3>{}, Layout<Shape<_8, _32>, Stride<_32, _1>>{})),
+         decltype(composition(Swizzle<3, 3, 3>{}, Layout<Shape<_16, _64>, Stride<_64, _1>>{}))
+     >;
+@@ -87,7 +92,7 @@ struct Flash_fwd_kernel_traits : public Base {
+     //     Shape<Int<kHeadDim>, Int<kBlockN>>{}));
+ 
+     using SmemLayoutAtomV = std::conditional_t<
+-        kHeadDim == 96,
++        (kHeadDim == 96 || kHeadDim == 32),
+         decltype(composition(Swizzle<2, 3, 3>{}, Layout<Shape<_8, _32>, Stride<_32, _1>>{})),
+         decltype(composition(Swizzle<3, 3, 3>{}, Layout<Shape<_16, _64>, Stride<_64, _1>>{}))
+     >;
+@@ -101,19 +106,19 @@ struct Flash_fwd_kernel_traits : public Base {
+ 
+ 
+     using GmemLayoutAtomQK = std::conditional_t<
+-        kHeadDim == 96,
++        (kHeadDim == 96 || kHeadDim == 32),
+         Layout<Shape<_64, _4>, Stride<_4, _1>>,
+         Layout<Shape<_32, _8>, Stride<_8, _1>>>;
+ 
+     // using GmemLayoutAtomV = Layout<Shape <_8, _32>, Stride<_1, _8>>;
+     using GmemLayoutAtomV = std::conditional_t<
+-        kHeadDim == 96,
++        (kHeadDim == 96 || kHeadDim == 32),
+         Layout<Shape<_64, _4>, Stride<_4, _1>>,
+         Layout<Shape<_32, _8>, Stride<_8, _1>>>;
+ 
+ 
+     using GmemLayoutAtomO = std::conditional_t<
+-        kHeadDim == 96,
++        (kHeadDim == 96 || kHeadDim == 32),
+         Layout<Shape<_64, _4>, Stride<_4, _1>>,
+         Layout<Shape<_32, _8>, Stride<_8, _1>>>;
+ 
+@@ -165,7 +170,7 @@ struct Flash_bwd_kernel_traits : public Base {
+     using TiledMma_dQ = TiledMMA<
+         typename Base::MMA_Atom_Arch,
+         Layout<Shape<_2, Int<kNWarps/2>, _1>>,
+-        std::conditional_t<kHeadDim == 96,
++        std::conditional_t<(kHeadDim == 96 || kHeadDim == 32),
+             Tile<Int<kBlockM>, Int<32>, _8>,
+             Tile<Int<kBlockM>, Int<kHeadDim>, _8>
+         >>;
+@@ -173,7 +178,7 @@ struct Flash_bwd_kernel_traits : public Base {
+     using TiledMma_dKdV = TiledMMA<
+         typename Base::MMA_Atom_Arch,
+         Layout<Shape<_2, Int<kNWarps/2>, _1>>,
+-        std::conditional_t<kHeadDim == 96,
++        std::conditional_t<(kHeadDim == 96 || kHeadDim == 32),
+             Tile<Int<kBlockN>, Int<32>, _8>,
+             Tile<Int<kBlockN>, Int<kHeadDim>, _8>
+         >>;
+@@ -195,7 +200,7 @@ struct Flash_bwd_kernel_traits : public Base {
+     // QKV
+     // swizzle atom
+     using SmemLayoutAtomQKV = std::conditional_t<
+-        kHeadDim == 96,
++        (kHeadDim == 96 || kHeadDim == 32),
+         decltype(composition(Swizzle<2, 3, 3>{}, Layout<Shape<_8, _32>, Stride<_32, _1>>{})),
+         decltype(composition(Swizzle<3, 3, 3>{}, Layout<Shape<_16, _64>, Stride<_64, _1>>{}))
+     >;
+@@ -210,7 +215,7 @@ struct Flash_bwd_kernel_traits : public Base {
+ 
+     // swizzle K
+     using SmemLayoutAtomKV = std::conditional_t<
+-        kHeadDim == 96,
++        (kHeadDim == 96 || kHeadDim == 32),
+         decltype(composition(Swizzle<2, 3, 3>{}, Layout<Shape<Int<8>, Int<32>>, Stride<Int<32>, _1>>{})),
+         decltype(composition(Swizzle<3, 3, 3>{}, Layout<Shape<Int<16>, Int<64>>, Stride<Int<64>, _1>>{}))
+     >;
+@@ -248,7 +253,7 @@ struct Flash_bwd_kernel_traits : public Base {
+     using SmemCopyAtomKt = std::conditional_t<
+         kHeadDim == 64,
+         Copy_Atom<SM75_U16x4_LDSM_T, elem_type>,
+-        std::conditional_t<kHeadDim == 96,
++        std::conditional_t<(kHeadDim == 96 || kHeadDim == 32),
+             Copy_Atom<SM75_U16x2_LDSM_T, elem_type>,
+             Copy_Atom<SM75_U16x8_LDSM_T, elem_type>
+         >
+@@ -257,7 +262,7 @@ struct Flash_bwd_kernel_traits : public Base {
+     using SmemCopyAtomQt = std::conditional_t<
+         kHeadDim == 64,
+         Copy_Atom<SM75_U16x4_LDSM_T, elem_type>,
+-        std::conditional_t<kHeadDim == 96,
++        std::conditional_t<(kHeadDim == 96 || kHeadDim == 32),
+             Copy_Atom<SM75_U16x2_LDSM_T, elem_type>,
+             Copy_Atom<SM75_U16x8_LDSM_T, elem_type>
+         >
+@@ -267,7 +272,7 @@ struct Flash_bwd_kernel_traits : public Base {
+     using SmemCopyAtomdOt = std::conditional_t<
+         kHeadDim == 64,
+         Copy_Atom<SM75_U16x4_LDSM_T, elem_type>,
+-        std::conditional_t<kHeadDim == 96,
++        std::conditional_t<(kHeadDim == 96 || kHeadDim == 32),
+             Copy_Atom<SM75_U16x2_LDSM_T, elem_type>,
+             Copy_Atom<SM75_U16x8_LDSM_T, elem_type>
+         >
+@@ -276,7 +281,7 @@ struct Flash_bwd_kernel_traits : public Base {
+     // using SmemCopyAtomQtdOtPtdSt = Copy_Atom<SM75_U16x8_LDSM_T, elem_type>;
+ 
+     using SmemCopyAtomPtdSt = std::conditional_t<
+-        kHeadDim == 96,
++        (kHeadDim == 96 || kHeadDim == 32),
+         Copy_Atom<SM75_U16x2_LDSM_T, elem_type>,
+         Copy_Atom<SM75_U16x8_LDSM_T, elem_type>
+     >;
+@@ -287,7 +292,7 @@ struct Flash_bwd_kernel_traits : public Base {
+ 
+     //gmem loads
+     using GmemLayoutAtom = std::conditional_t<
+-        kHeadDim == 96,
++        (kHeadDim == 96 || kHeadDim == 32),
+         Layout<Shape<_64, _4>, Stride<_4, _1>>,
+         Layout<Shape<_32, _8>, Stride<_8, _1>>>;
+ 
+diff --git a/csrc/flash_attn/src/static_switch.h b/csrc/flash_attn/src/static_switch.h
+index 14092d5bade1e42803e0c41d895df2d243ccc786..982f009570772f5376bc68d370165a3267eea92e 100644
+--- a/csrc/flash_attn/src/static_switch.h
++++ b/csrc/flash_attn/src/static_switch.h
+@@ -26,6 +26,27 @@
+     }                                           \
+   }()
+ 
++  // Native D32 kernels are opt-in (build with FLASH_TURING_NATIVE_D32=1, see setup.py).
++  // Without the flag, D32 keeps using the V1 zero-pad-to-D64 path in flash_api.cpp
++  // and no D32 kernel is referenced.
++#ifdef FLASH_TURING_NATIVE_D32
++  #define HEADDIM_SWITCH(HEADDIM, ...)        \
++    [&] {                                     \
++      if (HEADDIM == 32) {                   \
++        constexpr static int kHeadDim = 32;  \
++        return __VA_ARGS__();                 \
++      } else if (HEADDIM == 64) {            \
++        constexpr static int kHeadDim = 64;  \
++        return __VA_ARGS__();                 \
++      } else if (HEADDIM == 96) {            \
++        constexpr static int kHeadDim = 96;  \
++        return __VA_ARGS__();                 \
++      } else if (HEADDIM == 128) {           \
++        constexpr static int kHeadDim = 128;   \
++        return __VA_ARGS__();                 \
++      }                                       \
++    }()
++#else
+   #define HEADDIM_SWITCH(HEADDIM, ...)        \
+     [&] {                                     \
+       if (HEADDIM == 64) {                   \
+@@ -39,4 +60,4 @@
+         return __VA_ARGS__();                 \
+       }                                       \
+     }()
+-
++#endif
+diff --git a/flash_attention_interface.py b/flash_attention_interface.py
+index a60d4b6e8872a500d8815e085a69506d14b3713d..09a0513f9d93b231b51b21a4ab8dfe74ef626b3f 100644
+--- a/flash_attention_interface.py
++++ b/flash_attention_interface.py
+@@ -7,7 +7,7 @@ import torch
+ 
+ 
+ def maybe_contiguous(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+-    return x.contiguous() if x is not None and x.stride(-1) != 1 else x
++    return x.contiguous() if x is not None and not x.is_contiguous() else x
+ 
+ 
+ def _flash_attn_forward(
+diff --git a/setup.py b/setup.py
+index 9647cd74c1ac26a03f66f6384c5fe43132f9fa76..37cf487b5aa59bc082bf1a529e1e97b4fc2672f9 100644
+--- a/setup.py
++++ b/setup.py
+@@ -25,12 +25,32 @@ if sys.platform == "win32":
+     if compiler.compiler_type == "msvc":
+         nvcc_flags[0] = "-std=c++17"
+         nvcc_flags.extend(["-Xcompiler", "/Zc:preprocessor"])
++# Opt-in native D32 kernels (default: V1 zero-pad-to-D64 path).
++#   set FLASH_TURING_NATIVE_D32=1   (cmd: set FLASH_TURING_NATIVE_D32=1)
++native_d32 = os.environ.get("FLASH_TURING_NATIVE_D32", "0") == "1"
++
++# V2 forward-kernel variants (all opt-in, default = V1 kernel math/schedule). See README_V2.md.
++#   set FLASH_TURING_SEPV=1     separate V smem buffer + V staged in registers
++#   set FLASH_TURING_FASTSM=1   exp2-domain softmax, no separate S*=scale pass (needs softmax_scale > 0)
++v2_macros = []
++if os.environ.get("FLASH_TURING_SEPV", "0") == "1":
++    v2_macros.append(("FLASH_TURING_SEPV", "1"))
++if os.environ.get("FLASH_TURING_FASTSM", "0") == "1":
++    v2_macros.append(("FLASH_TURING_FASTSM", "1"))
++native_d32_sources = [
++    "csrc/flash_attn/src/flash_fwd_hdim32_fp16_sm75.cu",
++    "csrc/flash_attn/src/flash_fwd_hdim32_fp16_causal_sm75.cu",
++    "csrc/flash_attn/src/flash_bwd_hdim32_fp16_sm75.cu",
++    "csrc/flash_attn/src/flash_bwd_hdim32_fp16_causal_sm75.cu",
++] if native_d32 else []
++
+ setup(
+     name="flash_attn_turing",
+     ext_modules=[
+         CUDAExtension(
+             name="flash_attn_turing",
+             sources=["csrc/flash_attn/flash_api.cpp",
++                     "csrc/flash_attn/src/d32_pad_sm75.cu",
+                      "csrc/flash_attn/src/flash_fwd_hdim64_fp16_sm75.cu",
+                      "csrc/flash_attn/src/flash_fwd_hdim64_fp16_causal_sm75.cu",
+                      "csrc/flash_attn/src/flash_fwd_hdim96_fp16_sm75.cu",
+@@ -43,7 +63,8 @@ setup(
+                      "csrc/flash_attn/src/flash_bwd_hdim96_fp16_causal_sm75.cu",
+                      "csrc/flash_attn/src/flash_bwd_hdim128_fp16_sm75.cu",
+                      "csrc/flash_attn/src/flash_bwd_hdim128_fp16_causal_sm75.cu"
+-                     ],
++                     ] + native_d32_sources,
++            define_macros=([("FLASH_TURING_NATIVE_D32", "1")] if native_d32 else []) + v2_macros,
+             include_dirs=[
+                 Path(this_dir) / "csrc" / "flash_attn",
+                 Path(this_dir) / "csrc" / "flash_attn" / "src",
+diff --git a/test_flashattn_guardrails.py b/test_flashattn_guardrails.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..5b30e651994fe780a83f1c923f9070fb976579d8
+--- /dev/null
++++ b/test_flashattn_guardrails.py
+@@ -0,0 +1,169 @@
++#!/usr/bin/env python3
++"""Supplemental CUDA tests for the A+B+C+D guardrail branch.
++
++Run after building/installing the extension in the target Windows environment:
++    py -3.12 test_flashattn_guardrails.py
++
++Covers cases absent from the original 72-case suite: Q/K length mismatch,
++causal Q>K zero rows, B>1, non-contiguous views with stride(-1)==1, and
++unsupported head-dimension rejection.
++"""
++from __future__ import annotations
++
++import math
++import traceback
++
++import torch
++
++from flash_attention_interface import flash_attn_func
++import flash_attn_turing as flash_attn_gpu
++
++
++ATOL = 8e-3
++RTOL = 8e-3
++RESULTS: list[tuple[str, bool, str]] = []
++
++
++def reference_attention(q, k, v, causal: bool):
++    """FP32 attention reference matching this fork's bottom-right causal mask."""
++    hq, hk = q.shape[2], k.shape[2]
++    if hq % hk:
++        raise ValueError(f"Hq={hq} must be divisible by Hk={hk}")
++    if hq != hk:
++        ratio = hq // hk
++        k = k.repeat_interleave(ratio, dim=2)
++        v = v.repeat_interleave(ratio, dim=2)
++
++    qf = q.float().transpose(1, 2)
++    kf = k.float().transpose(1, 2)
++    vf = v.float().transpose(1, 2)
++    scores = torch.matmul(qf, kf.transpose(-2, -1)) / math.sqrt(q.shape[-1])
++
++    if causal:
++        sq, sk = q.shape[1], k.shape[1]
++        qi = torch.arange(sq, device=q.device)[:, None]
++        ki = torch.arange(sk, device=q.device)[None, :]
++        allowed = (ki - qi) <= (sk - sq)
++        scores = scores.masked_fill(~allowed[None, None, :, :], float("-inf"))
++        has_any = allowed.any(dim=-1)[None, None, :, None]
++        scores = torch.where(has_any, scores, torch.zeros_like(scores))
++        probs = torch.softmax(scores, dim=-1)
++        probs = probs.masked_fill(~allowed[None, None, :, :], 0.0)
++    else:
++        probs = torch.softmax(scores, dim=-1)
++    return torch.matmul(probs, vf).transpose(1, 2).to(q.dtype)
++
++
++def compare(actual, expected, label: str):
++    if not torch.isfinite(actual).all():
++        raise AssertionError(f"{label}: actual contains NaN/Inf")
++    if not torch.isfinite(expected).all():
++        raise AssertionError(f"{label}: reference contains NaN/Inf")
++    diff = (actual.float() - expected.float()).abs()
++    max_err = diff.max().item() if diff.numel() else 0.0
++    if not torch.allclose(actual, expected, atol=ATOL, rtol=RTOL):
++        raise AssertionError(f"{label}: max_abs={max_err:.7g}")
++    return max_err
++
++
++def run_fwd_bwd_case(name: str, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, causal: bool):
++    q = q.detach().requires_grad_(True)
++    k = k.detach().requires_grad_(True)
++    v = v.detach().requires_grad_(True)
++    out = flash_attn_func(q, k, v, causal=causal)
++
++    qr = q.detach().clone().requires_grad_(True)
++    kr = k.detach().clone().requires_grad_(True)
++    vr = v.detach().clone().requires_grad_(True)
++    ref = reference_attention(qr, kr, vr, causal)
++    fwd_err = compare(out, ref, name + " forward")
++
++    grad_out = torch.randn_like(out)
++    got = torch.autograd.grad(out, (q, k, v), grad_outputs=grad_out)
++    want = torch.autograd.grad(ref, (qr, kr, vr), grad_outputs=grad_out)
++    grad_errs = [compare(a, b, f"{name} {tag}") for tag, a, b in zip(("dQ", "dK", "dV"), got, want)]
++    return f"forward_max={fwd_err:.6g}; grad_max={max(grad_errs):.6g}"
++
++
++def record(name: str, fn):
++    try:
++        detail = fn()
++        RESULTS.append((name, True, detail))
++        print(f"[PASS] {name} | {detail}")
++    except Exception:
++        detail = traceback.format_exc().strip().replace("\n", " | ")
++        RESULTS.append((name, False, detail))
++        print(f"[FAIL] {name} | {detail}")
++
++
++def main() -> int:
++    if not torch.cuda.is_available():
++        print("[FATAL] CUDA is not available; run this test on the SM75 target.")
++        return 2
++
++    device = "cuda"
++    dtype = torch.float16
++    torch.manual_seed(20261109)
++    torch.cuda.manual_seed_all(20261109)
++
++    # Q longer than K: verifies early-returned query blocks and zero-initialized output.
++    for causal in (False, True):
++        name = f"B2 D32 Q200 K64 causal={causal}"
++        def case_q_gt_k(causal=causal):
++            q = torch.randn(2, 200, 4, 32, device=device, dtype=dtype)
++            k = torch.randn(2, 64, 4, 32, device=device, dtype=dtype)
++            v = torch.randn_like(k)
++            detail = run_fwd_bwd_case(name, q, k, v, causal)
++            if causal:
++                # Under bottom-right causal alignment, the first 128 query rows have no legal key.
++                # Those rows must be explicitly zero, not uninitialized output memory.
++                out = flash_attn_func(q, k, v, causal=True)
++                if not torch.equal(out[:, :128], torch.zeros_like(out[:, :128])):
++                    raise AssertionError("fully masked leading query rows are not exactly zero")
++            return detail
++        record(name, case_q_gt_k)
++
++    # K longer than Q: checks the opposite length direction and its bottom-right mask offset.
++    for causal in (False, True):
++        name = f"B2 D32 Q64 K200 causal={causal}"
++        def case_k_gt_q(causal=causal):
++            q = torch.randn(2, 64, 4, 32, device=device, dtype=dtype)
++            k = torch.randn(2, 200, 4, 32, device=device, dtype=dtype)
++            v = torch.randn_like(k)
++            return run_fwd_bwd_case(name, q, k, v, causal)
++        record(name, case_k_gt_q)
++
++    # These views are non-contiguous but retain stride(-1)==1, the case the old wrapper missed.
++    name = "non-contiguous inputs with inner stride 1"
++    def case_noncontiguous():
++        qb = torch.randn(2, 4, 129, 32, device=device, dtype=dtype)
++        kb = torch.randn(2, 4, 129, 32, device=device, dtype=dtype)
++        vb = torch.randn(2, 4, 129, 32, device=device, dtype=dtype)
++        q, k, v = (x.transpose(1, 2) for x in (qb, kb, vb))
++        assert q.stride(-1) == 1 and not q.is_contiguous()
++        assert k.stride(-1) == 1 and not k.is_contiguous()
++        assert v.stride(-1) == 1 and not v.is_contiguous()
++        return run_fwd_bwd_case(name, q, k, v, causal=False)
++    record(name, case_noncontiguous)
++
++    name = "reject unsupported head dimension 48"
++    def case_unsupported_dim():
++        q = torch.randn(1, 16, 2, 48, device=device, dtype=dtype)
++        try:
++            flash_attn_gpu.fwd(q, q, q, 1.0 / math.sqrt(48), False)
++        except RuntimeError as exc:
++            if "Unsupported head dimension" not in str(exc):
++                raise AssertionError(f"unexpected error: {exc}") from exc
++            return "rejected with expected TORCH_CHECK"
++        raise AssertionError("head dimension 48 was not rejected")
++    record(name, case_unsupported_dim)
++
++    torch.cuda.synchronize()
++    passed = sum(ok for _, ok, _ in RESULTS)
++    failed = len(RESULTS) - passed
++    print(f"\nGUARDRAIL SUMMARY: PASS={passed} FAIL={failed} TOTAL={len(RESULTS)}")
++    return 1 if failed else 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tools/bench_v2.py b/tools/bench_v2.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..67f73e052cacf392175fa4d562373f460963bf5e
+--- /dev/null
++++ b/tools/bench_v2.py
+@@ -0,0 +1,200 @@
++"""
++A/B benchmark + quick correctness gate for the V2 speed variants (run on the Turing GPU).
++
++Per shape and head dim it prints, for FlashAttn-Turing and torch SDPA:
++  event ms  : CUDA-event time of back-to-back calls   (includes CPU launch gaps - what V1 reported)
++  graph ms  : same call replayed from a CUDA graph    (GPU time only - no Python/ATen/launch overhead)
++  kernels   : GPU ops per call (memsets + kernels), from torch.profiler
++If 'event' >> 'graph' the call is host/launch bound; if they match, the kernel itself is the limit.
++
++Correctness gate (--check, on by default): forward output and, with --bwd, dq/dk/dv versus an
++fp32 reference, using the same tolerance style as a fp16 attention test (max abs err).
++
++Typical use (build each variant into its own venv/site-packages or rebuild between runs):
++  python bench_v2.py --tag base      > base.txt
++  python bench_v2.py --tag sepv      > sepv.txt        # built with FLASH_TURING_SEPV=1
++  python bench_v2.py --tag sepv_fastsm > both.txt      # built with both flags
++"""
++import argparse
++import statistics
++from collections import Counter
++
++import torch
++import torch.nn.functional as F
++from torch.profiler import profile, ProfilerActivity
++
++from flash_attention_interface import flash_attn_func
++import flash_attn_turing as flash_attn_gpu
++
++
++def event_ms(fn, warmup=10, iters=50, rounds=5):
++    for _ in range(warmup):
++        fn()
++    torch.cuda.synchronize()
++    res = []
++    for _ in range(rounds):
++        s, e = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
++        s.record()
++        for _ in range(iters):
++            fn()
++        e.record()
++        torch.cuda.synchronize()
++        res.append(s.elapsed_time(e) / iters)
++    return statistics.median(res)
++
++
++def graph_ms(fn, warmup=10, iters=50, rounds=5):
++    for _ in range(warmup):          # warm-up also performs one-time setup (smem attribute, allocator)
++        fn()
++    torch.cuda.synchronize()
++    g = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(g):
++        for _ in range(10):
++            fn()
++    res = []
++    for _ in range(rounds):
++        s, e = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
++        s.record()
++        for _ in range(iters // 10 or 1):
++            g.replay()
++        e.record()
++        torch.cuda.synchronize()
++        res.append(s.elapsed_time(e) / (10 * (iters // 10 or 1)))
++    return statistics.median(res)
++
++
++def gpu_ops_per_call(fn, iters=20):
++    for _ in range(5):
++        fn()
++    torch.cuda.synchronize()
++    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
++        for _ in range(iters):
++            fn()
++        torch.cuda.synchronize()
++    names = Counter(ev.name for ev in prof.events()
++                    if ev.device_type == torch.autograd.DeviceType.CUDA)
++    return sum(names.values()) / iters
++
++
++def ref_attn(q, k, v, causal, scale):
++    qf, kf, vf = (x.float().transpose(1, 2) for x in (q, k, v))       # B,H,S,D
++    hq, hk = qf.shape[1], kf.shape[1]
++    if hq != hk:
++        kf = kf.repeat_interleave(hq // hk, 1)
++        vf = vf.repeat_interleave(hq // hk, 1)
++    s = (qf @ kf.transpose(-1, -2)) * scale
++    if causal:
++        sq, sk = s.shape[-2:]
++        qi = torch.arange(sq, device=s.device)[:, None]
++        ki = torch.arange(sk, device=s.device)[None, :]
++        allowed = (ki - qi) <= (sk - sq)  # this fork uses bottom-right causal alignment
++        s = s.masked_fill(~allowed[None, None, :, :], float("-inf"))
++        has_any = allowed.any(dim=-1)[None, None, :, None]
++        # Avoid softmax(all -inf) -> NaN for query rows with no legal key.
++        s = torch.where(has_any, s, torch.zeros_like(s))
++        p = torch.softmax(s, -1).masked_fill(~allowed[None, None, :, :], 0.0)
++    else:
++        p = torch.softmax(s, -1)
++    return (p @ vf).transpose(1, 2)
++
++
++def check(d, b, sq, sk, h, hk, causal, bwd):
++    torch.manual_seed(0)
++    mk = lambda s, hh: torch.randn(b, s, hh, d, device="cuda", dtype=torch.float16, requires_grad=bwd)
++    q, k, v = mk(sq, h), mk(sk, hk), mk(sk, hk)
++    scale = d ** -0.5
++    out = flash_attn_func(q, k, v, causal=causal)
++    ref = ref_attn(q, k, v, causal, scale)
++    fwd_err = (out.float() - ref).abs().max().item()
++    msg = f"fwd max|err|={fwd_err:.2e}"
++    ok = fwd_err < 2e-2
++    if bwd:
++        g = torch.randn_like(out)
++        dq, dk, dv = torch.autograd.grad(out, (q, k, v), g)
++        rq, rk, rv = (x.detach().float().requires_grad_() for x in (q, k, v))
++        rr = ref_attn(rq, rk, rv, causal, scale)
++        gq, gk, gv = torch.autograd.grad(rr, (rq, rk, rv), g.float())
++        e = [(a.float() - r).abs().max().item() for a, r in ((dq, gq), (dk, gk), (dv, gv))]
++        msg += f" | dq/dk/dv max|err|={e[0]:.2e}/{e[1]:.2e}/{e[2]:.2e}"
++        ok = ok and max(e) < 5e-2
++    return ok, msg
++
++
++def benchmark_backward(d, b, s, heads, causal):
++    """Time the extension backward API separately from forward and report SDPA autograd."""
++    q, k, v = (torch.randn(b, s, h, d, device="cuda", dtype=torch.float16)
++               for h in (heads, heads, heads))
++    scale = d ** -0.5
++    # Prepare saved forward tensors outside the timed region.
++    out, lse = flash_attn_gpu.fwd(q, k, v, scale, causal)
++    dout = torch.randn_like(out)
++    fa_bwd = lambda: flash_attn_gpu.bwd(q, k, v, out, lse, dout, scale, causal)
++    fa_ms = event_ms(fa_bwd)
++    fa_ops = gpu_ops_per_call(fa_bwd)
++
++    # SDPA backward is measured on a retained prebuilt autograd graph.
++    qg, kg, vg = (x.detach().requires_grad_(True) for x in (q, k, v))
++    sd_out = F.scaled_dot_product_attention(
++        qg.transpose(1, 2), kg.transpose(1, 2), vg.transpose(1, 2),
++        is_causal=causal,
++    )
++    sd_grad = dout.transpose(1, 2).contiguous()
++    sd_bwd = lambda: torch.autograd.grad(
++        sd_out, (qg, kg, vg), grad_outputs=sd_grad, retain_graph=True,
++    )
++    sd_ms = event_ms(sd_bwd)
++    return fa_ms, sd_ms, fa_ops
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--tag", default="run")
++    ap.add_argument("--dims", type=int, nargs="+", default=[32, 64, 96, 128])
++    ap.add_argument("--seqs", type=int, nargs="+", default=[128, 256, 512, 1024, 2048])
++    ap.add_argument("--batches", type=int, nargs="+", default=[1, 4])
++    ap.add_argument("--heads", type=int, default=8)
++    ap.add_argument("--no-check", action="store_true")
++    ap.add_argument("--bwd", action="store_true", help="also check backward")
++    args = ap.parse_args()
++
++    print(f"# tag={args.tag}  torch={torch.__version__}  gpu={torch.cuda.get_device_name()}")
++    if not args.no_check:
++        bad = 0
++        for d in args.dims:
++            for (sq, sk) in ((130, 130), (257, 257), (64, 200), (200, 64)):
++                for causal in (False, True):
++                    for (h, hk) in ((4, 4), (8, 2)):
++                        ok, msg = check(d, 2, sq, sk, h, hk, causal, args.bwd)
++                        if not ok:
++                            bad += 1
++                            print(f"CHECK FAIL d={d} sq={sq} sk={sk} causal={causal} h={h}/{hk}: {msg}")
++        print(f"# correctness gate: {'PASS' if bad == 0 else f'{bad} FAIL'}")
++
++    print("d,b,s,causal,fa_event_ms,fa_graph_ms,sdpa_event_ms,sdpa_graph_ms,fa_gpu_ops,fa_vs_sdpa_graph")
++    for d in args.dims:
++        for b in args.batches:
++            for s in args.seqs:
++                for causal in (False, True):
++                    q, k, v = (torch.randn(b, s, args.heads, d, device="cuda", dtype=torch.float16)
++                               for _ in range(3))
++                    qt, kt, vt = (x.transpose(1, 2) for x in (q, k, v))
++                    fa = lambda: flash_attn_func(q, k, v, causal=causal)
++                    sd = lambda: F.scaled_dot_product_attention(qt, kt, vt, is_causal=causal)
++                    fe, fg = event_ms(fa), graph_ms(fa)
++                    se, sg = event_ms(sd), graph_ms(sd)
++                    ops = gpu_ops_per_call(fa)
++                    print(f"{d},{b},{s},{int(causal)},{fe:.4f},{fg:.4f},{se:.4f},{sg:.4f},{ops:.1f},{fg / sg:.2f}")
++
++    if args.bwd:
++        print("# Backward-only timings; forward outputs/LSE are prepared before timing.")
++        print("d,b,s,causal,fa_bwd_event_ms,sdpa_bwd_event_ms,fa_bwd_gpu_ops")
++        for d in args.dims:
++            for b in args.batches:
++                for s in args.seqs:
++                    for causal in (False, True):
++                        fa_ms, sd_ms, ops = benchmark_backward(d, b, s, args.heads, causal)
++                        print(f"{d},{b},{s},{int(causal)},{fa_ms:.4f},{sd_ms:.4f},{ops:.1f}")
++
++
++if __name__ == "__main__":
++    main()

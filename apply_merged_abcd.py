@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""Apply the merged A+B+C+D source overlay to an exact V1 source tree.
+
+Run from the target flash-attention-turing project root:
+    py -3.12 <bundle>\\apply_merged_abcd.py
+The script refuses to overwrite modified source files whose SHA256 differs from V1.
+"""
+from pathlib import Path
+import hashlib, json, shutil, sys
+
+BUNDLE = Path(__file__).resolve().parent
+OVERLAY = BUNDLE / "source_overlay"
+EXPECTED_BASE = json.loads(r"""{
+  "csrc/flash_attn/flash_api.cpp": "53347a630d9dd6c58b7ef99748a2619db76b941e29e4493a69074d65220ca319",
+  "csrc/flash_attn/src/d32_pad.h": null,
+  "csrc/flash_attn/src/d32_pad_sm75.cu": null,
+  "csrc/flash_attn/src/flash_bwd_hdim32_fp16_causal_sm75.cu": null,
+  "csrc/flash_attn/src/flash_bwd_hdim32_fp16_sm75.cu": null,
+  "csrc/flash_attn/src/flash_bwd_launch_template.h": "af06b7bf8f29ff00edc923767e95ad01177291474490e34060c8c2fdc67f26c3",
+  "csrc/flash_attn/src/flash_bwd_preprocess_kernel.h": "7a5281c78801786b8854d55a9a8c958d87fb1660d5133b2b49b254d383300da7",
+  "csrc/flash_attn/src/flash_fwd_hdim32_fp16_causal_sm75.cu": null,
+  "csrc/flash_attn/src/flash_fwd_hdim32_fp16_sm75.cu": null,
+  "csrc/flash_attn/src/flash_fwd_kernel.h": "1724ff495e69e39ad87cc5aca0ea96ad6823e2b082381cd211b5e9af19531c07",
+  "csrc/flash_attn/src/flash_fwd_launch_template.h": "f15e0f4c7b96ce216646e558bb01405e98efb61eb1c75e3b1dd4ca9f2bb22c76",
+  "csrc/flash_attn/src/kernel_traits.h": "83a075d5c9b420a78e64920523c0554f998e8ad44462d6072598ff9e4e441caa",
+  "csrc/flash_attn/src/static_switch.h": "8d75053c25c5917b6f2502f96af43e90a31f1f9b38fbc2ef5bd6f84e43d17256",
+  "flash_attention_interface.py": "45d562310ea2114ae4375fcd36782416e334677eff043c2c50d042069e399ef5",
+  "setup.py": "ba306c14f76061d1883c68ffae0a76c65d96796395f33b783ffd2d11f18f47da",
+  "test_flashattn_guardrails.py": null,
+  "tools/bench_v2.py": null
+}""")
+EXPECTED_OVERLAY = json.loads(r"""{
+  "csrc/flash_attn/flash_api.cpp": "7946b2e5bc412e83185116884637a9bf395c88607b6e2515861bbed682a9a0c2",
+  "csrc/flash_attn/src/d32_pad.h": "1600a6c7f74ff02d11bca9026dae29bc0a6eadd1c22a163ff73b6ad82f5f9464",
+  "csrc/flash_attn/src/d32_pad_sm75.cu": "5a351c9acb54c9c2e15a503d94e4ccfdd835d852f7a53b028414e473dfc3176e",
+  "csrc/flash_attn/src/flash_bwd_hdim32_fp16_causal_sm75.cu": "8fc1ae9db3444a34686da3f4ef50ffc22cd1d06e1b9f9bba8d12441664cb3717",
+  "csrc/flash_attn/src/flash_bwd_hdim32_fp16_sm75.cu": "d563c795f320c94e3d9abf2475ed74183747282f4a4ebe2797c2fe27d890812e",
+  "csrc/flash_attn/src/flash_bwd_launch_template.h": "1913bd0fb483557197e9a4c25ddc52edd4a59a273672130de31eb9c6b3a75407",
+  "csrc/flash_attn/src/flash_bwd_preprocess_kernel.h": "60db1d4e0b95f7068f3b9e5a7b40a0de5b397a122c71407cd2ea28cf09393d48",
+  "csrc/flash_attn/src/flash_fwd_hdim32_fp16_causal_sm75.cu": "51db4126710fb15dbc9f261f8b2101320bc7b356b0e6f4355a32c436e84a88dd",
+  "csrc/flash_attn/src/flash_fwd_hdim32_fp16_sm75.cu": "ce20d667ce78184c8df5a4a7c546bfe58231543009ec4bbb3174bd3cab201177",
+  "csrc/flash_attn/src/flash_fwd_kernel.h": "48cbf945408f9960dddb013048946b8d7ed7fdcd3749400b5f48f806cbf21f45",
+  "csrc/flash_attn/src/flash_fwd_launch_template.h": "4f65c81c8a6b17b6df874e474b4a87f3623f8d94962a68312d51d7163edff33c",
+  "csrc/flash_attn/src/kernel_traits.h": "3ceb0538ebf019be7cf1b321c2a3d8a6313f994e8f891eeed1389d6ec0ef4071",
+  "csrc/flash_attn/src/static_switch.h": "6c117846d142e178d711758e144b215e3b4b0fe3e46815524b7da3ddae80fb0b",
+  "flash_attention_interface.py": "dc4b825095ad3865927e27d379cbf21e7c5ce60fcf0ec102e3186b1f02ac97ca",
+  "setup.py": "bd527f3b07d7b1e55aa0c29da5b060472c679dbfa947d63203f8b48c435328af",
+  "test_flashattn_guardrails.py": "da77cf863feabdf9ca00751c5271560e81ed744b678b7899704c9cd7eac2a7ec",
+  "tools/bench_v2.py": "8a0ff9f302ecb5e6211f5356ad0d1b549ccc3d50e991ef0911a6bcf777147b42"
+}""")
+ROOT = Path.cwd().resolve()
+
+if not (ROOT / "setup.py").is_file() or not (ROOT / "csrc/flash_attn/flash_api.cpp").is_file():
+    print("ERROR: Run this script with current directory set to the flash-attention-turing project root.")
+    raise SystemExit(2)
+
+errors = []
+for rel, expected in EXPECTED_BASE.items():
+    target = ROOT / rel
+    if expected is None:
+        if target.exists():
+            got = hashlib.sha256(target.read_bytes()).hexdigest()
+            if got != EXPECTED_OVERLAY[rel]:
+                errors.append(f"NEW FILE ALREADY EXISTS WITH DIFFERENT CONTENT: {rel}")
+    else:
+        if not target.is_file():
+            errors.append(f"MISSING V1 FILE: {rel}")
+        else:
+            got = hashlib.sha256(target.read_bytes()).hexdigest()
+            if got != expected and got != EXPECTED_OVERLAY[rel]:
+                errors.append(f"NOT CLEAN V1 / LOCAL MODIFICATION: {rel} (sha256={got})")
+
+if errors:
+    print("ABORTED. No files were changed:")
+    for e in errors: print(" - " + e)
+    print("Use a fresh copy of the V1 freeze source. Do not overwrite a locally modified tree.")
+    raise SystemExit(3)
+
+backup = ROOT / ".backup_abcd_v1"
+if backup.exists():
+    print(f"ERROR: Backup folder already exists: {backup}")
+    print("Rename it or use a fresh project copy; no files were changed.")
+    raise SystemExit(4)
+backup.mkdir()
+
+for rel, expected in EXPECTED_BASE.items():
+    src = OVERLAY / rel
+    dst = ROOT / rel
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists() and expected is not None:
+        b = backup / rel
+        b.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(dst, b)
+    shutil.copy2(src, dst)
+    got = hashlib.sha256(dst.read_bytes()).hexdigest()
+    if got != EXPECTED_OVERLAY[rel]:
+        raise RuntimeError(f"Post-copy hash mismatch: {rel}")
+
+manifest = {
+    "base": "FlashAttention Turing V1 freeze source",
+    "patch": "A+B+C+D merged",
+    "native_d32_compiled": True,
+    "source_files": EXPECTED_OVERLAY,
+}
+(ROOT / "ABCD_APPLIED_MANIFEST.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+print(f"Applied {len(EXPECTED_OVERLAY)} files successfully.")
+print(f"Backups of replaced V1 files: {backup}")
+print("The V1 freeze archive itself was not modified.")
