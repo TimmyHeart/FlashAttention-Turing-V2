@@ -1,0 +1,152 @@
+{
+  "version": "2.2",
+  "created": "2026-11-09",
+  "status": "candidate_not_hardware_validated",
+  "base": "FlashAttention Turing V2 A+B+C+D freeze 2026-11-09",
+  "baseline_normalized_sha256": {
+    "flash_attention_interface.py": "056843766adf18439a341696e27edd45f3fac1788a4af56b45f13254e56c4945",
+    "csrc/flash_attn/flash_api.cpp": "5feb7ef3205f15141a42796cc448856f9f98c63e1fc5bd55908615afe8caaed1"
+  },
+  "modified_project_files": [
+    "flash_attention_interface.py",
+    "csrc/flash_attn/flash_api.cpp"
+  ],
+  "validation_summary": {
+    "python_mock_passed": 7,
+    "gpu_hostpath_cases_planned": 33,
+    "v2_regression_cases_planned": 78,
+    "apply_restore_smoke": "PASS",
+    "msvc_nvcc_build": "NOT_RUN",
+    "cmp_40hx_correctness": "NOT_RUN",
+    "cmp_40hx_benchmark": "NOT_RUN"
+  },
+  "manifest_excludes_itself": true,
+  "sha256_file": "SHA256SUMS.txt",
+  "files": [
+    {
+      "path": "MERGE_DECISIONS.md",
+      "size": 1518,
+      "sha256": "3921e24668dc6bd0bca938885e22223fe1eeaf858f97ca257a9be96f3c333d78"
+    },
+    {
+      "path": "README_V22.md",
+      "size": 7348,
+      "sha256": "c642db94feec973e6459d773926739e6e3355d321f9e6a8b0ce719a65de3094d"
+    },
+    {
+      "path": "RUN_V22_APPLY.bat",
+      "size": 232,
+      "sha256": "da5702c12b7419de5a3d005b1a1a4e943de4f4331db448dfd4b7646b16bd7a0c"
+    },
+    {
+      "path": "RUN_V22_BENCHMARK.bat",
+      "size": 1718,
+      "sha256": "8e703200102ad8416ed7221ad42866e6a26bdd2c66b80d43225d23a8869cb6f5"
+    },
+    {
+      "path": "RUN_V22_BUILD.bat",
+      "size": 1724,
+      "sha256": "22135c33f50f7679180581a69101f4192846982c573c3cfcc53f3df49a141106"
+    },
+    {
+      "path": "RUN_V22_RESTORE.bat",
+      "size": 196,
+      "sha256": "701b579e311e7c54dfccce0851f622d34727b38f79308b361263a071ed544db2"
+    },
+    {
+      "path": "RUN_V22_TESTS.bat",
+      "size": 820,
+      "sha256": "5a26ba9ec7b649c7fd8c6d7d730b17fc7045979632e6d8d847fe82aebf64b18d"
+    },
+    {
+      "path": "SOURCE_VALIDATION_RESULTS.txt",
+      "size": 1756,
+      "sha256": "3b7d5e388386d736657c9a737f59f2af382c7f70c86029ea5c3b80252bfa7e7d"
+    },
+    {
+      "path": "V2_BUILD_CONFIG_PROVENANCE.txt",
+      "size": 277,
+      "sha256": "c4bbce9e4cefdd440ed3b4245d672aa3b8f465d2e48693ee894327bba2e43321"
+    },
+    {
+      "path": "V2_to_V22.patch",
+      "size": 12205,
+      "sha256": "ab436cb26f398821a921dc630303d8e786ad8c0883fe62b5fafdefadc4af14ab"
+    },
+    {
+      "path": "apply_v22_overlay.py",
+      "size": 3654,
+      "sha256": "d1e592d1d2a900f2113caeedd099cd4070de461a5a09075f6b2a86ad7ec7c520"
+    },
+    {
+      "path": "flash_attn_v22.py",
+      "size": 6119,
+      "sha256": "50177dfc71ad15ae81b69b064fbaad8d4bfe1bda9d0c1d1b454f6a853a87a5c2"
+    },
+    {
+      "path": "research/claude_candidate/README_V2_1_HOST_OVERHEAD.md",
+      "size": 6958,
+      "sha256": "6dd9ab30d720783fa144bc43ff5e2cb62c37bb8b7b99c5d21c71c8926feb8e49"
+    },
+    {
+      "path": "research/claude_candidate/evidence/cpu_mock_dispatch_tests.txt",
+      "size": 2995,
+      "sha256": "39d1b9c5e8332d2d7cfeed1aac6753ffa2b6c8ee9c239607983ad59a48a6c044"
+    },
+    {
+      "path": "research/claude_candidate/evidence/cpu_mock_python_overhead.txt",
+      "size": 1316,
+      "sha256": "dcbe83dd1887e8ce013e48088a74d7c3f552c77464f0919eb3a92d0a02b5c701"
+    },
+    {
+      "path": "research/claude_candidate/evidence/cxx_syntax_check.txt",
+      "size": 465,
+      "sha256": "d9d2a99c6f982f6cf4a2dee8232f8da224737d0ab56c1f6284c3e3b62f19f7db"
+    },
+    {
+      "path": "research/claude_candidate/evidence/freeze_host_gap_analysis.txt",
+      "size": 2249,
+      "sha256": "7f30bae753a2b547772d65f8ca1b3953429608e7eca690740fa67133e08ad162"
+    },
+    {
+      "path": "restore_v22_overlay.py",
+      "size": 2670,
+      "sha256": "e7f152e81aacb2008243deab8d1eb2a8f6f12a5363339d9a543420f254f64209"
+    },
+    {
+      "path": "source_overlay_v22/csrc/flash_attn/flash_api.cpp",
+      "size": 32293,
+      "sha256": "c273867fa865c374f11637a9ba738024312926341ba27387e01fa451fb8a99ab"
+    },
+    {
+      "path": "source_overlay_v22/flash_attention_interface.py",
+      "size": 21556,
+      "sha256": "3eea82228b888e964e687d0be5c5e0c4351ec363b69bab7859483e895e649386"
+    },
+    {
+      "path": "tools/bench_host_overhead_v22.py",
+      "size": 10288,
+      "sha256": "d9a88fa0765215ab4b8a3bd9c7b331c809ed667a66641bc7f532531d8b7c7037"
+    },
+    {
+      "path": "validation/test_flashattn_all_head_dims_v1.py",
+      "size": 24019,
+      "sha256": "600c82795d1bc899107dec17963953f7610ae4836b7a8f955fe8558d4435c1bc"
+    },
+    {
+      "path": "validation/test_flashattn_guardrails.py",
+      "size": 6872,
+      "sha256": "da77cf863feabdf9ca00751c5271560e81ed744b678b7899704c9cd7eac2a7ec"
+    },
+    {
+      "path": "validation/test_v22_hostpath.py",
+      "size": 8925,
+      "sha256": "3693c695844b5dc39c8ab20b3a4b7cd040c61ff118f45dda33ff055e91767132"
+    },
+    {
+      "path": "validation/test_v22_python_mock.py",
+      "size": 3040,
+      "sha256": "a78d05d325f7c134e3f6bce6316753e6bc4c04d85e85c1afb5ff57627fe73f14"
+    }
+  ]
+}

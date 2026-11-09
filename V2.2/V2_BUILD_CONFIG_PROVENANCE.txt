@@ -1,0 +1,6 @@
+Copied from V2 freeze: source/ABCD/BUILD_ABCD_FULL_SM75.bat
+Defines retained:
+FLASH_TURING_NATIVE_D32=1
+FLASH_TURING_SEPV=1
+FLASH_TURING_FASTSM=1
+No V2 kernel/source changes beyond additive host API in flash_api.cpp and Python dispatch changes in flash_attention_interface.py.

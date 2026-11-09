@@ -1,0 +1,301 @@
+--- a/flash_attention_interface.py
++++ b/flash_attention_interface.py
+@@ -1,10 +1,24 @@
+-"""Python interface for FlashAttention Turing extension."""
+-
++"""Python interface for FlashAttention Turing extension.
++
++V2.2 (host-overhead optimization candidate): flash_attn_func / flash_attn_varlen_func skip
++torch.autograd.Function.apply when no gradient will be recorded (grad mode off, or none of
++q/k/v requires grad). The result is identical; only the per-call Python/autograd cost is
++removed. Set FLASH_TURING_DISABLE_FASTPATH=1 to restore the V2 behaviour exactly.
++"""
++
++import os
+ from typing import Optional, Tuple
+ 
++import torch
+ import flash_attn_turing as flash_attn_gpu
+-import torch
++
++# Bound once: avoids a module attribute lookup per call on the hot path.
++_ext_fwd = flash_attn_gpu.fwd
++_ext_varlen_fwd = flash_attn_gpu.varlen_fwd
++_ext_fwd_into = getattr(flash_attn_gpu, "fwd_into", None)  # added by V2.2
++_is_grad_enabled = torch.is_grad_enabled
++_FASTPATH = os.environ.get("FLASH_TURING_DISABLE_FASTPATH", "0") != "1"
+ 
+ 
+ def maybe_contiguous(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+     return x.contiguous() if x is not None and not x.is_contiguous() else x
+@@ -16,16 +30,15 @@
+     v: torch.Tensor,
+     softmax_scale: float,
+     causal: bool,
+ ) -> Tuple[torch.Tensor, torch.Tensor]:
+-    q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+-    out, lse = flash_attn_gpu.fwd(
+-        q,
+-        k,
+-        v,
+-        softmax_scale,
+-        causal,
+-    )
++    if not q.is_contiguous():
++        q = q.contiguous()
++    if not k.is_contiguous():
++        k = k.contiguous()
++    if not v.is_contiguous():
++        v = v.contiguous()
++    out, lse = _ext_fwd(q, k, v, softmax_scale, causal)
+     return out, lse
+ 
+ 
+ def _flash_attn_backward(
+@@ -63,9 +76,9 @@
+     softmax_scale: float,
+     causal: bool,
+ ) -> Tuple[torch.Tensor, torch.Tensor]:
+     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+-    out, lse = flash_attn_gpu.varlen_fwd(
++    out, lse = _ext_varlen_fwd(
+         q,
+         k,
+         v,
+         cu_seqlens_q,
+@@ -401,15 +414,21 @@
+         causal: bool. Whether to apply causal attention mask.
+     Return:
+         out: (batch_size, seqlen_q, nheads, headdim).
+     """
++    grad_mode = _is_grad_enabled()
++    if _FASTPATH and not (grad_mode and (q.requires_grad or k.requires_grad or v.requires_grad)):
++        # Inference / no-grad fast path: no autograd.Function, no ctx, nothing saved.
++        if softmax_scale is None:
++            softmax_scale = q.shape[-1] ** (-0.5)
++        return _flash_attn_forward(q, k, v, softmax_scale, causal)[0]
+     return FlashAttnFunc.apply(
+         q,
+         k,
+         v,
+         softmax_scale,
+         causal,
+-        torch.is_grad_enabled(),
++        grad_mode,
+     )
+ 
+ 
+ def flash_attn_qkvpacked_func(
+@@ -478,8 +497,15 @@
+         causal: bool. Whether to apply causal attention mask.
+     Return:
+         out: (total_q, nheads, headdim).
+     """
++    grad_mode = _is_grad_enabled()
++    if _FASTPATH and not (grad_mode and (q.requires_grad or k.requires_grad or v.requires_grad)):
++        if softmax_scale is None:
++            softmax_scale = q.shape[-1] ** (-0.5)
++        return _flash_attn_varlen_forward(
++            q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, softmax_scale, causal
++        )[0]
+     return FlashAttnVarlenFunc.apply(
+         q,
+         k,
+         v,
+@@ -488,9 +514,9 @@
+         max_seqlen_q,
+         max_seqlen_k,
+         softmax_scale,
+         causal,
+-        torch.is_grad_enabled(),
++        grad_mode,
+     )
+ 
+ 
+ def flash_attn_varlen_qkvpacked_func(
+@@ -552,4 +578,80 @@
+         softmax_scale,
+         causal,
+         torch.is_grad_enabled(),
+     )
++
++
++
++def _validate_fwd_into_inputs(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
++    """Strict validation for the hot-path inference API; never makes hidden copies."""
++    for name, tensor in (("q", q), ("k", k), ("v", v)):
++        if not isinstance(tensor, torch.Tensor):
++            raise TypeError(f"{name} must be a torch.Tensor")
++        if tensor.ndim != 4:
++            raise ValueError(f"{name} must be rank-4 [batch, sequence, heads, head_dim]")
++        if not tensor.is_cuda:
++            raise ValueError(f"{name} must be a CUDA tensor")
++        if tensor.dtype != torch.float16:
++            raise TypeError(f"{name} must have dtype torch.float16")
++        if not tensor.is_contiguous():
++            raise ValueError(f"{name} must be contiguous; V2.2 fwd_into never copies implicitly")
++        if tensor.requires_grad:
++            raise ValueError(f"{name} must not require gradients; fwd_into is inference-only")
++    if q.device != k.device or q.device != v.device:
++        raise ValueError("q, k, and v must be on the same CUDA device")
++    if q.shape[0] != k.shape[0] or q.shape[0] != v.shape[0]:
++        raise ValueError("q, k, and v must have the same batch size")
++    if k.shape[1] != v.shape[1] or k.shape[2] != v.shape[2]:
++        raise ValueError("k and v must have matching sequence/head dimensions")
++    if q.shape[-1] != k.shape[-1] or q.shape[-1] != v.shape[-1]:
++        raise ValueError("q, k, and v must have the same head dimension")
++    if q.shape[2] <= 0 or k.shape[2] <= 0 or q.shape[2] % k.shape[2] != 0:
++        raise ValueError("query/key-value head counts must be positive and q_heads divisible by kv_heads")
++
++
++def allocate_fwd_buffers(q: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
++    """Allocate reusable output/LSE buffers for fixed-length FP16 inference."""
++    if not isinstance(q, torch.Tensor) or q.ndim != 4:
++        raise ValueError("q must be rank-4 [batch, sequence, heads, head_dim]")
++    if not q.is_cuda or q.dtype != torch.float16 or not q.is_contiguous():
++        raise ValueError("q must be contiguous CUDA float16")
++    b, sq, h, _ = q.shape
++    out = torch.empty_like(q, memory_format=torch.contiguous_format)
++    lse = torch.empty((b, h, sq), device=q.device, dtype=torch.float32)
++    return out, lse
++
++
++def flash_attn_func_into(
++    q: torch.Tensor,
++    k: torch.Tensor,
++    v: torch.Tensor,
++    out: torch.Tensor,
++    lse: torch.Tensor,
++    softmax_scale: Optional[float] = None,
++    causal: bool = False,
++) -> torch.Tensor:
++    """Run inference directly into caller-owned FP16 output and FP32 LSE buffers.
++
++    Unlike flash_attn_func, this API is deliberately strict: q/k/v must be contiguous,
++    all buffers are caller-owned, and no autograd graph or implicit contiguous() copy is made.
++    """
++    if _ext_fwd_into is None:
++        raise RuntimeError("flash_attn_func_into requires the V2.2 native extension build (fwd_into is missing)")
++    _validate_fwd_into_inputs(q, k, v)
++    if not isinstance(out, torch.Tensor) or not isinstance(lse, torch.Tensor):
++        raise TypeError("out and lse must be torch.Tensor instances")
++    if out.device != q.device or out.dtype != torch.float16 or not out.is_contiguous():
++        raise ValueError("out must be contiguous CUDA float16 on q.device")
++    if tuple(out.shape) != tuple(q.shape):
++        raise ValueError("out must have the same shape as q")
++    expected_lse = (q.shape[0], q.shape[2], q.shape[1])
++    if lse.device != q.device or lse.dtype != torch.float32 or not lse.is_contiguous():
++        raise ValueError("lse must be contiguous CUDA float32 on q.device")
++    if tuple(lse.shape) != expected_lse:
++        raise ValueError(f"lse must have shape {expected_lse}")
++    if out.requires_grad or lse.requires_grad:
++        raise ValueError("out/lse buffers must not require gradients")
++    if softmax_scale is None:
++        softmax_scale = q.shape[-1] ** -0.5
++    _ext_fwd_into(q, k, v, out, lse, float(softmax_scale), bool(causal))
++    return out
+--- a/csrc/flash_attn/flash_api.cpp
++++ b/csrc/flash_attn/flash_api.cpp
+@@ -352,8 +352,92 @@
+     return {o, l};
+ 
+ }
+ 
++
++
++// V2.2: inference-only Forward into caller-owned buffers.
++// The original V2 mha_fwd remains unchanged; this additive entry point avoids
++// allocating output and LSE on every call and provides stable pointers for CUDA Graphs.
++void mha_fwd_into(at::Tensor q,
++                  at::Tensor k,
++                  at::Tensor v,
++                  at::Tensor o,
++                  at::Tensor l,
++                  const float softmax_scale,
++                  bool is_causal)
++{
++    TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
++                "q, k, v must be rank-4 tensors");
++
++    const int batch_size = q.size(0);
++    const int seqlen_q = q.size(1);
++    const int num_heads = q.size(2);
++    const int head_size = q.size(3);
++    const int seqlen_k = k.size(1);
++    const int num_heads_k = k.size(2);
++
++    TORCH_CHECK(k.size(0) == batch_size && v.size(0) == batch_size,
++                "k/v batch size must match q");
++    TORCH_CHECK(v.size(1) == seqlen_k, "k and v seqlen_k must match");
++    TORCH_CHECK(v.size(2) == num_heads_k, "k and v num_heads must match");
++    TORCH_CHECK(k.size(3) == head_size && v.size(3) == head_size,
++                "q/k/v head_dim must match");
++    TORCH_CHECK(num_heads > 0 && num_heads_k > 0 && num_heads % num_heads_k == 0,
++                "num_heads_q and num_heads_k must be positive and num_heads_q divisible by num_heads_k");
++    check_supported_head_size(head_size);
++    TORCH_CHECK(!(kD32UsePadding && head_size == 32),
++                "fwd_into requires FLASH_TURING_NATIVE_D32=1 for head dimension 32");
++
++    // This entry point is deliberately strict: no hidden contiguous() copies and no autograd.
++    check_fp16_cuda_contiguous(q, "q", q);
++    check_fp16_cuda_contiguous(k, "k", q);
++    check_fp16_cuda_contiguous(v, "v", q);
++    check_fp16_cuda_contiguous(o, "out", q);
++    check_fp32_cuda_contiguous(l, "lse", q);
++    TORCH_CHECK(o.sizes() == q.sizes(), "out must have the same shape as q");
++    TORCH_CHECK(l.dim() == 3 && l.size(0) == batch_size &&
++                l.size(1) == num_heads && l.size(2) == seqlen_q,
++                "lse must have shape [batch, nheads, seqlen_q]");
++    TORCH_CHECK(!q.requires_grad() && !k.requires_grad() && !v.requires_grad() &&
++                !o.requires_grad() && !l.requires_grad(),
++                "fwd_into is inference-only and does not support tensors requiring gradients");
++
++    // Reject any shared storage, not just identical data pointers. The output and
++    // LSE are independently written by the kernel and must not overlap inputs/each other.
++    TORCH_CHECK(!o.is_alias_of(q) && !o.is_alias_of(k) && !o.is_alias_of(v),
++                "out must not share storage with q/k/v");
++    TORCH_CHECK(!l.is_alias_of(q) && !l.is_alias_of(k) && !l.is_alias_of(v) &&
++                !l.is_alias_of(o),
++                "lse must not share storage with q/k/v/out");
++
++    c10::cuda::CUDAGuard device_guard(q.device());
++    check_softmax_scale(softmax_scale);
++
++    // Match V2's initialized-output behavior for empty inputs and causal Q>K.
++    // Some causal query rows are not visited by the attention grid in that case.
++    const bool fwd_needs_zero_fill = (seqlen_q == 0 || seqlen_k == 0 ||
++                                      (is_causal && seqlen_q > seqlen_k));
++    if (fwd_needs_zero_fill) {
++        o.zero_();
++        l.zero_();
++    }
++
++    Flash_fwd_params params;
++    set_params_fprop(params,
++                     batch_size,
++                     seqlen_q,
++                     seqlen_k,
++                     num_heads,
++                     num_heads_k,
++                     head_size,
++                     q, k, v, o, l,
++                     nullptr,
++                     nullptr,
++                     softmax_scale,
++                     is_causal);
++    run_mha_fwd(params);
++}
+ 
+ 
+ 
+ std::vector<at::Tensor>
+@@ -701,8 +785,9 @@
+ 
+ 
+ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+     m.def("fwd", &mha_fwd, "Forward pass");
++    m.def("fwd_into", &mha_fwd_into, "Inference forward into caller-owned output/LSE buffers");
+     m.def("bwd", &mha_bwd, "Backward pass");
+     m.def("varlen_fwd", &mha_varlen_fwd, "Varlen forward pass");
+     m.def("varlen_bwd", &mha_varlen_bwd, "Varlen backward pass");
+ }
