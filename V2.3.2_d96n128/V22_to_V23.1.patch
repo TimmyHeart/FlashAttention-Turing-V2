@@ -1,0 +1,3072 @@
+diff -ruN ./csrc/flash_attn/flash_api.cpp /mnt/data/_build_v23_hotfix/flashattn_turing_v23_small_tile_candidate_fixed/source_overlay_v23/csrc/flash_attn/flash_api.cpp
+--- ./csrc/flash_attn/flash_api.cpp	2026-11-09 13:12:43.062829034 +0000
++++ /mnt/data/_build_v23_hotfix/flashattn_turing_v23_small_tile_candidate_fixed/source_overlay_v23/csrc/flash_attn/flash_api.cpp	2026-11-09 13:14:28.594542704 +0000
+@@ -1,9 +1,12 @@
+ #include <torch/extension.h>
+ #include <cmath>
++#include <atomic>
++#include <climits>
+ #include <c10/cuda/CUDAException.h>
+ #include "flash.h"
+ #include "static_switch.h"
+ #include "d32_pad.h"
++#include "flash_fwd_tiles.h"
+ #include <c10/cuda/CUDAGuard.h>
+ #include <c10/cuda/CUDAStream.h>
+ 
+@@ -234,10 +237,99 @@
+ }
+ 
+ 
++// ---------------------------------------------------------------------------------------------
++// V2.3 forward tile selection.
++// FLASH_TURING_SMALLM=1 compiles the kBlockM=64 (4 warp) kernels, =2 also kBlockM=32 (2 warp).
++// With neither defined, run_mha_fwd launches exactly the V2/V2.2 kBlockM=128 kernels.
++// Mode 0 = automatic (cost model below); 128/64/32 force one tile (for A/B and the tuner).
++// ---------------------------------------------------------------------------------------------
++#ifdef FLASH_TURING_SMALLM
++static constexpr int kFwdTileCompiled = FLASH_TURING_SMALLM;
++#else
++static constexpr int kFwdTileCompiled = 0;
++#endif
++static std::atomic<int> g_fwd_tile_mode{0};
++// Per-row-block fixed cost (in units of query rows) used by the automatic model: the K/V loop
++// has latency that does not shrink with kBlockM, so a smaller tile is not proportionally faster.
++static std::atomic<int> g_fwd_tile_fixed_cost{48};
++
++static inline int device_sm_count() {
++    static std::atomic<int> cache[16];
++    int dev = 0;
++    C10_CUDA_CHECK(cudaGetDevice(&dev));
++    if (dev >= 0 && dev < 16) {
++        const int cached = cache[dev].load(std::memory_order_relaxed);
++        if (cached > 0) return cached;
++    }
++    int sms = 0;
++    C10_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
++    if (sms <= 0) sms = 1;
++    if (dev >= 0 && dev < 16) cache[dev].store(sms, std::memory_order_relaxed);
++    return sms;
++}
++
++static inline int plan_fwd_tile(const int b, const int seqlen_q, const int h) {
++    if (kFwdTileCompiled <= 0) return 128;
++    const int mode = g_fwd_tile_mode.load(std::memory_order_relaxed);
++    if (mode != 0) return mode;
++    const long long sms = device_sm_count();
++    const long long bh = static_cast<long long>(b) * static_cast<long long>(h);
++    const long long fixed = g_fwd_tile_fixed_cost.load(std::memory_order_relaxed);
++    int best = 128;
++    long long best_cost = LLONG_MAX;
++    const int candidates[3] = {128, 64, 32};
++    for (int t : candidates) {
++        if (t == 64 && kFwdTileCompiled < 1) continue;
++        if (t == 32 && kFwdTileCompiled < 2) continue;
++        const long long ctas = ((static_cast<long long>(seqlen_q) + t - 1) / t) * bh;
++        const long long waves = (ctas + sms - 1) / sms;
++        const long long cost = waves * (t + fixed);
++        if (cost < best_cost) { best_cost = cost; best = t; }
++    }
++    return best;
++}
++
++static void set_fwd_tile_mode(const int mode) {
++    TORCH_CHECK(mode == 0 || mode == 128 || mode == 64 || mode == 32,
++                "fwd tile mode must be 0 (auto), 128, 64 or 32");
++    TORCH_CHECK(mode != 64 || kFwdTileCompiled >= 1,
++                "kBlockM=64 kernels were not compiled (build with FLASH_TURING_SMALLM=1 or 2)");
++    TORCH_CHECK(mode != 32 || kFwdTileCompiled >= 2,
++                "kBlockM=32 kernels were not compiled (build with FLASH_TURING_SMALLM=2)");
++    g_fwd_tile_mode.store(mode, std::memory_order_relaxed);
++}
++
++static void set_fwd_tile_fixed_cost(const int cost) {
++    TORCH_CHECK(cost >= 0 && cost <= 4096, "fixed cost must be in [0, 4096]");
++    g_fwd_tile_fixed_cost.store(cost, std::memory_order_relaxed);
++}
++
++// Keep preprocessor conditionals outside HEADDIM_SWITCH / BOOL_SWITCH macro arguments.
++// MSVC does not treat #if directives embedded in a macro argument as directives;
++// it parses the tokens as part of the lambda body and reports C2065/C2121.
++template <int Headdim, bool Is_causal>
++static inline void dispatch_mha_fwd_tile(Flash_fwd_params &params, const int tile) {
++    (void)tile;  // Also keeps the V2.2-only build warning-clean when SMALLM is not defined.
++#ifdef FLASH_TURING_SMALLM
++    if (tile == 64) {
++        run_mha_fwd_tile_<Headdim, Is_causal, 64>(params);
++        return;
++    }
++#if FLASH_TURING_SMALLM >= 2
++    if (tile == 32) {
++        run_mha_fwd_tile_<Headdim, Is_causal, 32>(params);
++        return;
++    }
++#endif
++#endif
++    run_mha_fwd_<Headdim, Is_causal>(params);
++}
++
+ void run_mha_fwd(Flash_fwd_params &params){
++    const int tile = plan_fwd_tile(params.b, params.seqlen_q, params.h);
+     HEADDIM_SWITCH(params.d, [&] {
+         BOOL_SWITCH(params.is_causal, Is_causal, [&] {
+-                run_mha_fwd_<kHeadDim, Is_causal>(params);
++            dispatch_mha_fwd_tile<kHeadDim, Is_causal>(params, tile);
+         });
+     });
+ }
+@@ -790,4 +882,15 @@
+     m.def("bwd", &mha_bwd, "Backward pass");
+     m.def("varlen_fwd", &mha_varlen_fwd, "Varlen forward pass");
+     m.def("varlen_bwd", &mha_varlen_bwd, "Varlen backward pass");
++    // V2.3 forward tile control (no effect unless built with FLASH_TURING_SMALLM >= 1)
++    m.def("set_fwd_tile_mode", &set_fwd_tile_mode, pybind11::arg("mode"),
++          "0 = auto, 128/64/32 = force that kBlockM for subsequent forward launches");
++    m.def("get_fwd_tile_mode", []() { return g_fwd_tile_mode.load(std::memory_order_relaxed); });
++    m.def("set_fwd_tile_fixed_cost", &set_fwd_tile_fixed_cost, pybind11::arg("cost"),
++          "Fixed per-row-block cost (in rows) used by the automatic tile model; default 48");
++    m.def("fwd_tile_support", []() { return kFwdTileCompiled; },
++          "0: only kBlockM=128; 1: also 64; 2: also 32");
++    m.def("plan_fwd_tile", [](int batch, int seqlen_q, int heads) { return plan_fwd_tile(batch, seqlen_q, heads); },
++          pybind11::arg("batch"), pybind11::arg("seqlen_q"), pybind11::arg("heads"),
++          "kBlockM the forward launch would use for this shape under the current mode");
+ }
+diff -ruN ./csrc/flash_attn/src/flash_fwd_hdim128_fp16_m32_causal_sm75.cu /mnt/data/_build_v23_hotfix/flashattn_turing_v23_small_tile_candidate_fixed/source_overlay_v23/csrc/flash_attn/src/flash_fwd_hdim128_fp16_m32_causal_sm75.cu
+--- ./csrc/flash_attn/src/flash_fwd_hdim128_fp16_m32_causal_sm75.cu	1970-01-01 00:00:00.000000000 +0000
++++ /mnt/data/_build_v23_hotfix/flashattn_turing_v23_small_tile_candidate_fixed/source_overlay_v23/csrc/flash_attn/src/flash_fwd_hdim128_fp16_m32_causal_sm75.cu	2026-11-09 13:09:29.580300460 +0000
+@@ -0,0 +1,10 @@
++#include "flash_fwd_launch_template.h"
++
++#include <cutlass/numeric_types.h>
++
++using half_t = cutlass::half_t;
++
++template<>
++void run_mha_fwd_tile_<128, true, 32>(Flash_fwd_params &params) {
++    run_mha_fwd_tile_impl<128, 32, 2, true>(params);
++}
+diff -ruN ./csrc/flash_attn/src/flash_fwd_hdim128_fp16_m32_sm75.cu /mnt/data/_build_v23_hotfix/flashattn_turing_v23_small_tile_candidate_fixed/source_overlay_v23/csrc/flash_attn/src/flash_fwd_hdim128_fp16_m32_sm75.cu
+--- ./csrc/flash_attn/src/flash_fwd_hdim128_fp16_m32_sm75.cu	1970-01-01 00:00:00.000000000 +0000
++++ /mnt/data/_build_v23_hotfix/flashattn_turing_v23_small_tile_candidate_fixed/source_overlay_v23/csrc/flash_attn/src/flash_fwd_hdim128_fp16_m32_sm75.cu	2026-11-09 13:09:29.576002535 +0000
+@@ -0,0 +1,10 @@
++#include "flash_fwd_launch_template.h"
++
++#include <cutlass/numeric_types.h>
++
++using half_t = cutlass::half_t;
++
++template<>
++void run_mha_fwd_tile_<128, false, 32>(Flash_fwd_params &params) {
++    run_mha_fwd_tile_impl<128, 32, 2, false>(params);
++}
+diff -ruN ./csrc/flash_attn/src/flash_fwd_hdim128_fp16_m64_causal_sm75.cu /mnt/data/_build_v23_hotfix/flashattn_turing_v23_small_tile_candidate_fixed/source_overlay_v23/csrc/flash_attn/src/flash_fwd_hdim128_fp16_m64_causal_sm75.cu
+--- ./csrc/flash_attn/src/flash_fwd_hdim128_fp16_m64_causal_sm75.cu	1970-01-01 00:00:00.000000000 +0000
++++ /mnt/data/_build_v23_hotfix/flashattn_turing_v23_small_tile_candidate_fixed/source_overlay_v23/csrc/flash_attn/src/flash_fwd_hdim128_fp16_m64_causal_sm75.cu	2026-11-09 13:09:29.577359912 +0000
+@@ -0,0 +1,10 @@
++#include "flash_fwd_launch_template.h"
++
++#include <cutlass/numeric_types.h>
++
++using half_t = cutlass::half_t;
++
++template<>
++void run_mha_fwd_tile_<128, true, 64>(Flash_fwd_params &params) {
++    run_mha_fwd_tile_impl<128, 64, 4, true>(params);
++}
+diff -ruN ./csrc/flash_attn/src/flash_fwd_hdim128_fp16_m64_sm75.cu /mnt/data/_build_v23_hotfix/flashattn_turing_v23_small_tile_candidate_fixed/source_overlay_v23/csrc/flash_attn/src/flash_fwd_hdim128_fp16_m64_sm75.cu
+--- ./csrc/flash_attn/src/flash_fwd_hdim128_fp16_m64_sm75.cu	1970-01-01 00:00:00.000000000 +0000
++++ /mnt/data/_build_v23_hotfix/flashattn_turing_v23_small_tile_candidate_fixed/source_overlay_v23/csrc/flash_attn/src/flash_fwd_hdim128_fp16_m64_sm75.cu	2026-11-09 13:09:29.577604135 +0000
+@@ -0,0 +1,10 @@
++#include "flash_fwd_launch_template.h"
++
++#include <cutlass/numeric_types.h>
++
++using half_t = cutlass::half_t;
++
++template<>
++void run_mha_fwd_tile_<128, false, 64>(Flash_fwd_params &params) {
++    run_mha_fwd_tile_impl<128, 64, 4, false>(params);
++}
+diff -ruN ./csrc/flash_attn/src/flash_fwd_hdim32_fp16_m32_causal_sm75.cu /mnt/data/_build_v23_hotfix/flashattn_turing_v23_small_tile_candidate_fixed/source_overlay_v23/csrc/flash_attn/src/flash_fwd_hdim32_fp16_m32_causal_sm75.cu
+--- ./csrc/flash_attn/src/flash_fwd_hdim32_fp16_m32_causal_sm75.cu	1970-01-01 00:00:00.000000000 +0000
++++ /mnt/data/_build_v23_hotfix/flashattn_turing_v23_small_tile_candidate_fixed/source_overlay_v23/csrc/flash_attn/src/flash_fwd_hdim32_fp16_m32_causal_sm75.cu	2026-11-09 13:09:29.578239599 +0000
+@@ -0,0 +1,10 @@
++#include "flash_fwd_launch_template.h"
++
++#include <cutlass/numeric_types.h>
++
++using half_t = cutlass::half_t;
++
++template<>
++void run_mha_fwd_tile_<32, true, 32>(Flash_fwd_params &params) {
++    run_mha_fwd_tile_impl<32, 32, 2, true>(params);
++}
+diff -ruN ./csrc/flash_attn/src/flash_fwd_hdim32_fp16_m32_sm75.cu /mnt/data/_build_v23_hotfix/flashattn_turing_v23_small_tile_candidate_fixed/source_overlay_v23/csrc/flash_attn/src/flash_fwd_hdim32_fp16_m32_sm75.cu
+--- ./csrc/flash_attn/src/flash_fwd_hdim32_fp16_m32_sm75.cu	1970-01-01 00:00:00.000000000 +0000
++++ /mnt/data/_build_v23_hotfix/flashattn_turing_v23_small_tile_candidate_fixed/source_overlay_v23/csrc/flash_attn/src/flash_fwd_hdim32_fp16_m32_sm75.cu	2026-11-09 13:09:29.577052575 +0000
+@@ -0,0 +1,10 @@
++#include "flash_fwd_launch_template.h"
++
++#include <cutlass/numeric_types.h>
++
++using half_t = cutlass::half_t;
++
++template<>
++void run_mha_fwd_tile_<32, false, 32>(Flash_fwd_params &params) {
++    run_mha_fwd_tile_impl<32, 32, 2, false>(params);
++}
+diff -ruN ./csrc/flash_attn/src/flash_fwd_hdim32_fp16_m64_causal_sm75.cu /mnt/data/_build_v23_hotfix/flashattn_turing_v23_small_tile_candidate_fixed/source_overlay_v23/csrc/flash_attn/src/flash_fwd_hdim32_fp16_m64_causal_sm75.cu
+--- ./csrc/flash_attn/src/flash_fwd_hdim32_fp16_m64_causal_sm75.cu	1970-01-01 00:00:00.000000000 +0000
++++ /mnt/data/_build_v23_hotfix/flashattn_turing_v23_small_tile_candidate_fixed/source_overlay_v23/csrc/flash_attn/src/flash_fwd_hdim32_fp16_m64_causal_sm75.cu	2026-11-09 13:09:29.579964852 +0000
+@@ -0,0 +1,10 @@
++#include "flash_fwd_launch_template.h"
++
++#include <cutlass/numeric_types.h>
++
++using half_t = cutlass::half_t;
++
++template<>
++void run_mha_fwd_tile_<32, true, 64>(Flash_fwd_params &params) {
++    run_mha_fwd_tile_impl<32, 64, 4, true>(params);
++}
+diff -ruN ./csrc/flash_attn/src/flash_fwd_hdim32_fp16_m64_sm75.cu /mnt/data/_build_v23_hotfix/flashattn_turing_v23_small_tile_candidate_fixed/source_overlay_v23/csrc/flash_attn/src/flash_fwd_hdim32_fp16_m64_sm75.cu
+--- ./csrc/flash_attn/src/flash_fwd_hdim32_fp16_m64_sm75.cu	1970-01-01 00:00:00.000000000 +0000
++++ /mnt/data/_build_v23_hotfix/flashattn_turing_v23_small_tile_candidate_fixed/source_overlay_v23/csrc/flash_attn/src/flash_fwd_hdim32_fp16_m64_sm75.cu	2026-11-09 13:09:29.576606062 +0000
+@@ -0,0 +1,10 @@
++#include "flash_fwd_launch_template.h"
++
++#include <cutlass/numeric_types.h>
++
++using half_t = cutlass::half_t;
++
++template<>
++void run_mha_fwd_tile_<32, false, 64>(Flash_fwd_params &params) {
++    run_mha_fwd_tile_impl<32, 64, 4, false>(params);
++}
+diff -ruN ./csrc/flash_attn/src/flash_fwd_hdim64_fp16_m32_causal_sm75.cu /mnt/data/_build_v23_hotfix/flashattn_turing_v23_small_tile_candidate_fixed/source_overlay_v23/csrc/flash_attn/src/flash_fwd_hdim64_fp16_m32_causal_sm75.cu
+--- ./csrc/flash_attn/src/flash_fwd_hdim64_fp16_m32_causal_sm75.cu	1970-01-01 00:00:00.000000000 +0000
++++ /mnt/data/_build_v23_hotfix/flashattn_turing_v23_small_tile_candidate_fixed/source_overlay_v23/csrc/flash_attn/src/flash_fwd_hdim64_fp16_m32_causal_sm75.cu	2026-11-09 13:09:29.576818708 +0000
+@@ -0,0 +1,10 @@
++#include "flash_fwd_launch_template.h"
++
++#include <cutlass/numeric_types.h>
++
++using half_t = cutlass::half_t;
++
++template<>
++void run_mha_fwd_tile_<64, true, 32>(Flash_fwd_params &params) {
++    run_mha_fwd_tile_impl<64, 32, 2, true>(params);
++}
+diff -ruN ./csrc/flash_attn/src/flash_fwd_hdim64_fp16_m32_sm75.cu /mnt/data/_build_v23_hotfix/flashattn_turing_v23_small_tile_candidate_fixed/source_overlay_v23/csrc/flash_attn/src/flash_fwd_hdim64_fp16_m32_sm75.cu
+--- ./csrc/flash_attn/src/flash_fwd_hdim64_fp16_m32_sm75.cu	1970-01-01 00:00:00.000000000 +0000
++++ /mnt/data/_build_v23_hotfix/flashattn_turing_v23_small_tile_candidate_fixed/source_overlay_v23/csrc/flash_attn/src/flash_fwd_hdim64_fp16_m32_sm75.cu	2026-11-09 13:09:29.578664290 +0000
+@@ -0,0 +1,10 @@
++#include "flash_fwd_launch_template.h"
++
++#include <cutlass/numeric_types.h>
++
++using half_t = cutlass::half_t;
++
++template<>
++void run_mha_fwd_tile_<64, false, 32>(Flash_fwd_params &params) {
++    run_mha_fwd_tile_impl<64, 32, 2, false>(params);
++}
+diff -ruN ./csrc/flash_attn/src/flash_fwd_hdim64_fp16_m64_causal_sm75.cu /mnt/data/_build_v23_hotfix/flashattn_turing_v23_small_tile_candidate_fixed/source_overlay_v23/csrc/flash_attn/src/flash_fwd_hdim64_fp16_m64_causal_sm75.cu
+--- ./csrc/flash_attn/src/flash_fwd_hdim64_fp16_m64_causal_sm75.cu	1970-01-01 00:00:00.000000000 +0000
++++ /mnt/data/_build_v23_hotfix/flashattn_turing_v23_small_tile_candidate_fixed/source_overlay_v23/csrc/flash_attn/src/flash_fwd_hdim64_fp16_m64_causal_sm75.cu	2026-11-09 13:09:29.578032691 +0000
+@@ -0,0 +1,10 @@
++#include "flash_fwd_launch_template.h"
++
++#include <cutlass/numeric_types.h>
++
++using half_t = cutlass::half_t;
++
++template<>
++void run_mha_fwd_tile_<64, true, 64>(Flash_fwd_params &params) {
++    run_mha_fwd_tile_impl<64, 64, 4, true>(params);
++}
+diff -ruN ./csrc/flash_attn/src/flash_fwd_hdim64_fp16_m64_sm75.cu /mnt/data/_build_v23_hotfix/flashattn_turing_v23_small_tile_candidate_fixed/source_overlay_v23/csrc/flash_attn/src/flash_fwd_hdim64_fp16_m64_sm75.cu
+--- ./csrc/flash_attn/src/flash_fwd_hdim64_fp16_m64_sm75.cu	1970-01-01 00:00:00.000000000 +0000
++++ /mnt/data/_build_v23_hotfix/flashattn_turing_v23_small_tile_candidate_fixed/source_overlay_v23/csrc/flash_attn/src/flash_fwd_hdim64_fp16_m64_sm75.cu	2026-11-09 13:09:29.575577754 +0000
+@@ -0,0 +1,10 @@
++#include "flash_fwd_launch_template.h"
++
++#include <cutlass/numeric_types.h>
++
++using half_t = cutlass::half_t;
++
++template<>
++void run_mha_fwd_tile_<64, false, 64>(Flash_fwd_params &params) {
++    run_mha_fwd_tile_impl<64, 64, 4, false>(params);
++}
+diff -ruN ./csrc/flash_attn/src/flash_fwd_hdim96_fp16_m32_causal_sm75.cu /mnt/data/_build_v23_hotfix/flashattn_turing_v23_small_tile_candidate_fixed/source_overlay_v23/csrc/flash_attn/src/flash_fwd_hdim96_fp16_m32_causal_sm75.cu
+--- ./csrc/flash_attn/src/flash_fwd_hdim96_fp16_m32_causal_sm75.cu	1970-01-01 00:00:00.000000000 +0000
++++ /mnt/data/_build_v23_hotfix/flashattn_turing_v23_small_tile_candidate_fixed/source_overlay_v23/csrc/flash_attn/src/flash_fwd_hdim96_fp16_m32_causal_sm75.cu	2026-11-09 13:09:29.579432180 +0000
+@@ -0,0 +1,10 @@
++#include "flash_fwd_launch_template.h"
++
++#include <cutlass/numeric_types.h>
++
++using half_t = cutlass::half_t;
++
++template<>
++void run_mha_fwd_tile_<96, true, 32>(Flash_fwd_params &params) {
++    run_mha_fwd_tile_impl<96, 32, 2, true>(params);
++}
+diff -ruN ./csrc/flash_attn/src/flash_fwd_hdim96_fp16_m32_sm75.cu /mnt/data/_build_v23_hotfix/flashattn_turing_v23_small_tile_candidate_fixed/source_overlay_v23/csrc/flash_attn/src/flash_fwd_hdim96_fp16_m32_sm75.cu
+--- ./csrc/flash_attn/src/flash_fwd_hdim96_fp16_m32_sm75.cu	1970-01-01 00:00:00.000000000 +0000
++++ /mnt/data/_build_v23_hotfix/flashattn_turing_v23_small_tile_candidate_fixed/source_overlay_v23/csrc/flash_attn/src/flash_fwd_hdim96_fp16_m32_sm75.cu	2026-11-09 13:09:29.577848207 +0000
+@@ -0,0 +1,10 @@
++#include "flash_fwd_launch_template.h"
++
++#include <cutlass/numeric_types.h>
++
++using half_t = cutlass::half_t;
++
++template<>
++void run_mha_fwd_tile_<96, false, 32>(Flash_fwd_params &params) {
++    run_mha_fwd_tile_impl<96, 32, 2, false>(params);
++}
+diff -ruN ./csrc/flash_attn/src/flash_fwd_hdim96_fp16_m64_causal_sm75.cu /mnt/data/_build_v23_hotfix/flashattn_turing_v23_small_tile_candidate_fixed/source_overlay_v23/csrc/flash_attn/src/flash_fwd_hdim96_fp16_m64_causal_sm75.cu
+--- ./csrc/flash_attn/src/flash_fwd_hdim96_fp16_m64_causal_sm75.cu	1970-01-01 00:00:00.000000000 +0000
++++ /mnt/data/_build_v23_hotfix/flashattn_turing_v23_small_tile_candidate_fixed/source_overlay_v23/csrc/flash_attn/src/flash_fwd_hdim96_fp16_m64_causal_sm75.cu	2026-11-09 13:09:29.576376962 +0000
+@@ -0,0 +1,10 @@
++#include "flash_fwd_launch_template.h"
++
++#include <cutlass/numeric_types.h>
++
++using half_t = cutlass::half_t;
++
++template<>
++void run_mha_fwd_tile_<96, true, 64>(Flash_fwd_params &params) {
++    run_mha_fwd_tile_impl<96, 64, 4, true>(params);
++}
+diff -ruN ./csrc/flash_attn/src/flash_fwd_hdim96_fp16_m64_sm75.cu /mnt/data/_build_v23_hotfix/flashattn_turing_v23_small_tile_candidate_fixed/source_overlay_v23/csrc/flash_attn/src/flash_fwd_hdim96_fp16_m64_sm75.cu
+--- ./csrc/flash_attn/src/flash_fwd_hdim96_fp16_m64_sm75.cu	1970-01-01 00:00:00.000000000 +0000
++++ /mnt/data/_build_v23_hotfix/flashattn_turing_v23_small_tile_candidate_fixed/source_overlay_v23/csrc/flash_attn/src/flash_fwd_hdim96_fp16_m64_sm75.cu	2026-11-09 13:09:29.578909764 +0000
+@@ -0,0 +1,10 @@
++#include "flash_fwd_launch_template.h"
++
++#include <cutlass/numeric_types.h>
++
++using half_t = cutlass::half_t;
++
++template<>
++void run_mha_fwd_tile_<96, false, 64>(Flash_fwd_params &params) {
++    run_mha_fwd_tile_impl<96, 64, 4, false>(params);
++}
+diff -ruN ./csrc/flash_attn/src/flash_fwd_kernel.h /mnt/data/_build_v23_hotfix/flashattn_turing_v23_small_tile_candidate_fixed/source_overlay_v23/csrc/flash_attn/src/flash_fwd_kernel.h
+--- ./csrc/flash_attn/src/flash_fwd_kernel.h	2026-11-09 13:12:43.063620302 +0000
++++ /mnt/data/_build_v23_hotfix/flashattn_turing_v23_small_tile_candidate_fixed/source_overlay_v23/csrc/flash_attn/src/flash_fwd_kernel.h	2026-11-09 13:09:29.574825276 +0000
+@@ -1,773 +1,780 @@
+-#include <iostream>
+-#include <cstdlib>
+-#include <cstdio>
+-#include <cassert>
+-#include <float.h>
+-#include <torch/extension.h>
+-#include <cute/tensor.hpp>
+-
+-#include <cutlass/array.h>
+-#include <cutlass/cutlass.h>
+-#include <cutlass/numeric_conversion.h>
+-#include <cutlass/numeric_types.h>
+-
+-#include "block_info.h"
+-#include "kernel_traits.h"
+-#include "utils.h"
+-#include "mask.h"
+-
+-using namespace cute;
+-
+-// ---------------------------------------------------------------------------
+-// Opt-in forward-kernel variants (see README_V2.md). With neither macro defined
+-// this file compiles to exactly the V1 behaviour.
+-//   FLASH_TURING_SEPV   separate smem buffer for V + V staged through registers
+-//                       (hides V's global-load latency behind QK^T, 2 fewer
+-//                       __syncthreads per KV iteration). Needs
+-//                       (kBlockM + 2*kBlockN) * kHeadDim * 2 bytes of smem.
+-//   FLASH_TURING_FASTSM softmax in the exp2 domain without the separate
+-//                       S *= scale pass. Requires softmax_scale > 0.
+-// ---------------------------------------------------------------------------
+-#ifdef FLASH_TURING_FASTSM
+-  // exp(scale * d) == exp2(d * scale * log2(e)); d <= 0 here.
+-  #define FT_EXP(d)        exp2f((d) * scale_log2)
+-  #define FT_LSE_M(m)      ((m) * softmax_scale)
+-#else
+-  #define FT_EXP(d)        expf(d)
+-  #define FT_LSE_M(m)      (m)
+-#endif
+-
+-
+-// for some reason changing this into params struct is 15% slower for hdim = 128
+-template <typename Kernel_traits, bool Is_causal, bool Is_even_MN>
+-inline __device__ void compute_attn_1rowblock(
+-                          const half_t* __restrict__ q,
+-                          const half_t* __restrict__ k,
+-                          const half_t* __restrict__ v,
+-                          half_t* __restrict__ o,
+-                          float* __restrict__ l,
+-                          const int* __restrict__ cu_seqlens_q,
+-                          const int* __restrict__ cu_seqlens_k,
+-                          const int batch_size,
+-                          const int max_seqlen_q,
+-                          const int max_seqlen_k,
+-                          const int num_heads,
+-                          const int num_heads_k,
+-                          const int h_h_k_ratio,
+-                          const int head_dim,
+-                          const float softmax_scale,
+-                          const int is_casual,
+-                          const int bidb,
+-                          const int bidh,
+-                          const int m_block)
+-{
+-
+-    constexpr int kBlockM = Kernel_traits::kBlockM;
+-    constexpr int kBlockN = Kernel_traits::kBlockN;
+-    constexpr int kHeadDim = Kernel_traits::kHeadDim;
+-
+-
+-    const BlockInfo</*Varlen=*/!Is_even_MN> binfo(max_seqlen_q, max_seqlen_k, bidb, cu_seqlens_q, cu_seqlens_k);
+-    const int seqlen_q = binfo.actual_seqlen_q;
+-    const int seqlen_k = binfo.actual_seqlen_k;
+-
+-
+-    if (m_block * kBlockM >= seqlen_q) {
+-        return;
+-    }
+-
+-
+-    Tensor mQ = make_tensor(make_gmem_ptr(q + binfo.q_offset(num_heads * head_dim, bidb)),
+-                            make_shape(seqlen_q, num_heads, head_dim),
+-                            make_stride(num_heads * head_dim, head_dim, Int<1>{}));
+-
+-    Tensor gQ = local_tile(mQ(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{},
+-                           make_coord(m_block, 0));
+-
+-
+-
+-
+-    Tensor mK = make_tensor(make_gmem_ptr(k + binfo.k_offset(num_heads_k * head_dim, bidb)),
+-                            make_shape(seqlen_k, num_heads_k, head_dim),
+-                            make_stride(num_heads_k * head_dim, head_dim, Int<1>{}));
+-
+-    Tensor gK = local_tile(mK(_, bidh / h_h_k_ratio, _), Shape<Int<kBlockN>, Int<kHeadDim>>{},
+-                           make_coord(_, 0));
+-
+-
+-
+-    Tensor mV = make_tensor(make_gmem_ptr(v + binfo.k_offset(num_heads_k * head_dim, bidb)),
+-                            make_shape(seqlen_k, num_heads_k, head_dim),
+-                            make_stride(num_heads_k * head_dim, head_dim, Int<1>{}));
+-
+-    Tensor gV = local_tile(mV(_, bidh / h_h_k_ratio, _), Shape<Int<kBlockN>, Int<kHeadDim>>{},
+-                           make_coord(_, 0));
+-
+-
+-    Tensor mO = make_tensor(make_gmem_ptr(o + binfo.q_offset(num_heads * head_dim, bidb)),
+-                            make_shape(seqlen_q, num_heads, head_dim),
+-                            make_stride(num_heads * head_dim, head_dim, Int<1>{}));
+-
+-    Tensor gO = local_tile(mO(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{},
+-                           make_coord(m_block, 0));
+-
+-    // L = m + log l
+-    Tensor mL = make_tensor(make_gmem_ptr(reinterpret_cast<float*>(l)),
+-                             make_shape(batch_size, num_heads, max_seqlen_q),
+-                             make_stride(max_seqlen_q * num_heads, max_seqlen_q, Int<1>{}));
+-
+-    Tensor gL = local_tile(mL(bidb, bidh, _), Shape<Int<kBlockM>>{},
+-                           make_coord(m_block));
+-
+-
+-
+-    extern __shared__ char smem_[];
+-
+-
+-    Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<half_t*>(&smem_[0])), typename Kernel_traits::SmemLayoutQ{});
+-    Tensor sK = make_tensor(sQ.data() + kBlockM*kHeadDim, typename Kernel_traits::SmemLayoutK{});
+-#ifdef FLASH_TURING_SEPV
+-    // Q | K | V, no aliasing between K and V
+-    Tensor sV = make_tensor(sK.data() + kBlockN*kHeadDim, typename Kernel_traits::SmemLayoutV{});
+-    Tensor sVt = make_tensor(sV.data(), typename Kernel_traits::SmemLayoutVTransposed{});
+-#else
+-    Tensor sV = make_tensor(sK.data(), typename Kernel_traits::SmemLayoutV{});
+-    Tensor sVt = make_tensor(sK.data(), typename Kernel_traits::SmemLayoutVTransposed{});
+-#endif
+-    Tensor sO = make_tensor(make_smem_ptr(reinterpret_cast<half_t*>(&smem_[0])), typename Kernel_traits::SmemLayoutQ{});
+-
+-
+-
+-    const int lane_id = threadIdx.x % 32;
+-    const int warp_id = threadIdx.x / 32;
+-    const int thread_row = warp_id * 16 + lane_id / 4;
+-    const int global_row_offset = m_block * kBlockM;
+-
+-#ifdef FLASH_TURING_FASTSM
+-    const float scale_log2 = softmax_scale * 1.4426950408889634f;
+-#endif
+-    float rM_old[2] = {-FLT_MAX, -FLT_MAX};
+-    float rM[2] = {0.0f};
+-    float rL_old[2] = {0.0f};
+-    float rL[2] = {0.0f};
+-    // for storing rowsum(P)
+-    float rD[2] = {0.0f};
+-
+-    unsigned mask;
+-    if (lane_id < 4)       mask = 0x0000000F;  // Lanes  0 -  3
+-    else if (lane_id < 8)  mask = 0x000000F0;  // Lanes  4 -  7
+-    else if (lane_id < 12) mask = 0x00000F00;  // Lanes  8 - 11
+-    else if (lane_id < 16) mask = 0x0000F000;  // Lanes 12 - 15
+-    else if (lane_id < 20) mask = 0x000F0000;  // Lanes 16 - 19
+-    else if (lane_id < 24) mask = 0x00F00000;  // Lanes 20 - 23
+-    else if (lane_id < 28) mask = 0x0F000000;  // Lanes 24 - 27
+-    else                   mask = 0xF0000000;  // Lanes 28 - 31
+-
+-
+-    int lane_id_to_read_from;
+-    if (lane_id < 4)       lane_id_to_read_from = 0;   // Lanes  0 -  3
+-    else if (lane_id < 8)  lane_id_to_read_from = 4;   // Lanes  4 -  7
+-    else if (lane_id < 12) lane_id_to_read_from = 8;   // Lanes  8 - 11
+-    else if (lane_id < 16) lane_id_to_read_from = 12;  // Lanes 12 - 15
+-    else if (lane_id < 20) lane_id_to_read_from = 16;  // Lanes 16 - 19
+-    else if (lane_id < 24) lane_id_to_read_from = 20;  // Lanes 20 - 23
+-    else if (lane_id < 28) lane_id_to_read_from = 24;  // Lanes 24 - 27
+-    else                   lane_id_to_read_from = 28;  // Lanes 28 - 31
+-
+-    // gmem -> smem for Q, K, V
+-    typename Kernel_traits::GmemTiledCopyQK gmem_tiled_copy_QK;
+-    typename Kernel_traits::GmemTiledCopyV gmem_tiled_copy_V;
+-    typename Kernel_traits::GmemTiledCopyO gmem_tiled_copy_O;
+-
+-    ThrCopy thr_copy_QK = gmem_tiled_copy_QK.get_slice(threadIdx.x);
+-    Tensor tQgQ = thr_copy_QK.partition_S(gQ);
+-    Tensor tQsQ = thr_copy_QK.partition_D(sQ);
+-
+-
+-
+-
+-    Tensor tKgK = thr_copy_QK.partition_S(gK);
+-    Tensor tKsK = thr_copy_QK.partition_D(sK);
+-    Tensor tKrK = make_fragment_like(tKsK);
+-
+-
+-    ThrCopy thr_copy_V = gmem_tiled_copy_V.get_slice(threadIdx.x);
+-    Tensor tVgV = thr_copy_V.partition_S(gV);
+-    Tensor tVsV = thr_copy_V.partition_D(sV);
+-    Tensor tVrV = make_fragment_like(tVsV);
+-
+-    // smem -> gmem for O
+-    ThrCopy thr_copy_O = gmem_tiled_copy_O.get_slice(threadIdx.x);
+-    Tensor tOsO_copy = thr_copy_O.partition_S(sO);
+-    Tensor tOgO_copy = thr_copy_O.partition_D(gO);
+-
+-    // Identity tensors for bound-checking the masked copies
+-    Tensor cQ_identity = make_identity_tensor(make_shape(Int<kBlockM>{}, Int<kHeadDim>{}));
+-    Tensor cK_identity = make_identity_tensor(make_shape(Int<kBlockN>{}, Int<kHeadDim>{}));
+-    auto tCqQ = thr_copy_QK.partition_S(cQ_identity);
+-    auto tCqK = thr_copy_QK.partition_S(cK_identity);
+-    auto tCqO = thr_copy_O.partition_S(cQ_identity);
+-
+-
+-    typename Kernel_traits::TiledMma tiled_mma;
+-
+-    // mma for S = QK^T
+-    ThrMMA thr_mma_S = tiled_mma.get_slice(threadIdx.x);
+-    Tensor tSsQ = thr_mma_S.partition_A(sQ);
+-    Tensor tSsK = thr_mma_S.partition_B(sK);
+-
+-    Tensor tSrQ = thr_mma_S.make_fragment_A(tSsQ);
+-    Tensor tSrK = thr_mma_S.make_fragment_B(tSsK);
+-    Tensor tSrS_float = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});
+-
+-
+-    // mma for O = PV
+-    ThrMMA thr_mma_O = tiled_mma.get_slice(threadIdx.x);
+-    Tensor tOsV = thr_mma_O.partition_B(sVt);
+-    Tensor tOrV = thr_mma_O.make_fragment_B(tOsV);
+-    Tensor tOrO_float = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kHeadDim>>{});
+-    Tensor tOsO = thr_mma_O.partition_C(sO);
+-
+-
+-
+-
+-    //  each warp only process 16 rows
+-    auto s2r_tiled_copy_Q = make_tiled_copy_A(typename Kernel_traits::SmemCopyAtomQ{}, tiled_mma);
+-    auto s2r_thr_copy_Q = s2r_tiled_copy_Q.get_slice(threadIdx.x);
+-    auto tSsQ_copy_view = s2r_thr_copy_Q.partition_S(sQ);
+-    auto tSrQ_copy_view = s2r_thr_copy_Q.retile_D(tSrQ);
+-
+-    auto s2r_tiled_copy_K = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtomK{}, tiled_mma);
+-    auto s2r_thr_copy_K = s2r_tiled_copy_K.get_slice(threadIdx.x);
+-    auto tSsK_copy_view = s2r_thr_copy_K.partition_S(sK);
+-    auto tSrK_copy_view = s2r_thr_copy_K.retile_D(tSrK);
+-
+-    // auto s2r_tiled_copy_V = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtomV{}, tiled_mma);
+-    auto s2r_tiled_copy_V = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtomVt{}, tiled_mma);
+-    auto s2r_thr_copy_V = s2r_tiled_copy_V.get_slice(threadIdx.x);
+-    auto tOsV_copy_view = s2r_thr_copy_V.partition_S(sVt);
+-    auto tOrV_copy_view = s2r_thr_copy_V.retile_D(tOrV);
+-
+-    const int n_block_min = 0;
+-    int m_block_max = ceil_div(seqlen_q, kBlockM);
+-    int n_block_max = ceil_div(seqlen_k, kBlockN);
+-
+-
+-    int n_masking_steps = (!Is_causal)
+-        ? 1
+-        : ((Is_even_MN && Is_causal) ? ceil_div(kBlockM, kBlockN) : ceil_div(kBlockM, kBlockN) + 1);
+-
+-    int causal_offset = 0;
+-    int is_even_mn_offset = 0;
+-
+-    if constexpr(Is_causal) {
+-
+-        n_block_max = fmaxf(0, ceil_div((m_block + 1) * kBlockM + seqlen_k - seqlen_q, kBlockN));
+-        n_masking_steps = fminf(n_masking_steps, n_block_max);
+-
+-        causal_offset = seqlen_k - seqlen_q - (n_block_max - 1) * kBlockN + m_block * kBlockM;         
+-
+-    }        
+-
+-    is_even_mn_offset = seqlen_k - (n_block_max - 1) * kBlockN;
+-    
+-    // if seqlen_q > seqlen_k we exit early for the blocks with rows that are fully masked
+-    if (n_block_max == 0) {return;}
+-
+-    auto QK_BLOCK_MAX = size<2>(tSsK);
+-    auto PV_BLOCK_MAX = size<2>(tOsV);
+-
+-
+-    clear(tOrO_float);
+-    
+-    // prologue
+-
+-    // copy(gmem_tiled_copy_QK, tQgQ, tQsQ);
+-    masked_copy<Is_even_MN>(
+-        gmem_tiled_copy_QK, tQgQ, tQsQ, tCqQ, 
+-        seqlen_q - m_block * kBlockM, 
+-        /*clear_D=*/true);
+-
+-
+-
+-    int n_block = n_block_max - 1;
+-
+-
+-    // these are the blocks that need masking
+-    
+-    Mask<Is_causal> accum_s_mask(seqlen_q, seqlen_k);
+-    // constexpr bool Is_even_MN = true; 
+-
+-    masked_copy<Is_even_MN>(
+-        gmem_tiled_copy_QK, tKgK(_,_,_,n_block), tKrK, tCqK, 
+-        seqlen_k - n_block * kBlockN,
+-        /*clear_D=*/true);
+-    //copy(gmem_tiled_copy_QK, tKgK(_,_,_,n_block), tKrK);
+-    for (int masking_step = 0; masking_step < n_masking_steps; ++masking_step, --n_block) {
+-
+-        copy(gmem_tiled_copy_QK, tKrK, tKsK);
+-
+-        __syncthreads();
+-
+-        clear(tSrS_float);
+-
+-#ifdef FLASH_TURING_SEPV
+-        // V(n): global -> registers now (latency hidden behind the QK^T MMAs below)
+-        masked_copy<Is_even_MN>(
+-            gmem_tiled_copy_QK, tVgV(_,_,_,n_block), tVrV, tCqK,
+-            seqlen_k - n_block * kBlockN,
+-            /*clear_D=*/true);
+-#endif
+-
+-        // if (n_block + 1 < n_block_max) {
+-        //     copy(gmem_tiled_copy_QK, tKgK(_,_,_,n_block + 1), tKrK);
+-        // }
+-
+-
+-        if (n_block > n_block_min) {
+-
+-            masked_copy<Is_even_MN>(
+-                gmem_tiled_copy_QK, tKgK(_,_,_,n_block-1), tKrK, tCqK, 
+-                seqlen_k - (n_block-1) * kBlockN,
+-                /*clear_D=*/true);
+-            // copy(gmem_tiled_copy_QK, tKgK(_,_,_,n_block - 1 ), tKrK);
+-        }
+-
+-        CUTE_UNROLL
+-        for (int qk_block = 0; qk_block < QK_BLOCK_MAX; qk_block++) {
+-            copy(s2r_tiled_copy_Q, tSsQ_copy_view(_,_,qk_block), tSrQ_copy_view(_,_,qk_block));
+-            copy(s2r_tiled_copy_K, tSsK_copy_view(_,_,qk_block), tSrK_copy_view(_,_,qk_block));
+-
+-            gemm(tiled_mma, tSrQ(_,_,qk_block), tSrK(_,_,qk_block), tSrS_float);
+-
+-        }
+-
+-#ifdef FLASH_TURING_SEPV
+-        copy(gmem_tiled_copy_V, tVrV, tVsV);   // registers -> sV (own buffer)
+-        __syncthreads();
+-#else
+-        __syncthreads();
+-        masked_copy<Is_even_MN>(
+-            gmem_tiled_copy_QK, tVgV(_,_,_,n_block), tVsV, tCqK, 
+-            seqlen_k - n_block * kBlockN,
+-            /*clear_D=*/true);
+-
+-        // copy(gmem_tiled_copy_V, tVgV(_,_,_,n_block), tVsV);
+-        __syncthreads();
+-#endif
+-
+-
+-#ifndef FLASH_TURING_FASTSM
+-        // for now we rescale before we apply causal mask
+-        for (int i=0;i< tSrS_float.size();i ++ ) {
+-            tSrS_float[i] *= softmax_scale;
+-        }
+-#endif
+-
+-   
+-        accum_s_mask.template apply_mask_fwd<Is_causal, Is_even_MN>(
+-            tSrS_float, 
+-            warp_id, 
+-            lane_id,             
+-            kBlockN,              
+-            causal_offset,
+-            is_even_mn_offset
+-        );
+-
+-
+-
+-        // compute m = rowmax(S)
+-        for (int i=0; i< 2; i++) {
+-            rM[i] = rM_old[i];
+-        }
+-
+-
+-        // intra-thread reduction
+-
+-        for (int i=0; i< 2; i++) {
+-            for (int j=0; j < tSrS_float(make_coord(_,i),_,_).size(); j++) {
+-                rM[i] = fmaxf(rM[i], tSrS_float(make_coord(_,i),_,_)[j]);
+-            }
+-        }
+-
+-
+-        // intra-warp reduction
+-        for (int i=0; i<2; i++) {
+-            for (int offset = 2; offset > 0; offset /= 2) {
+-                rM[i] = fmaxf(rM[i], __shfl_down_sync(mask, rM[i], offset));
+-            }
+-        }
+-
+-
+-        // sync rM
+-
+-        for (int i =0; i<2; i++) {
+-            rM[i] = __shfl_sync(mask, rM[i], lane_id_to_read_from);
+-        }
+-
+-
+-
+-        // compute P = softmax(S)
+-        for (int i =0; i<2; i++) {
+-            for (int j=0; j < tSrS_float(make_coord(_,i),_,_).size(); j++) {
+-                if (rM[i] == -FLT_MAX) {
+-                    tSrS_float(make_coord(_,i),_,_)[j] = 0.0f;
+-                } else {
+-                    tSrS_float(make_coord(_,i),_,_)[j] = FT_EXP(tSrS_float(make_coord(_,i),_,_)[j] - rM[i]);
+-                }
+-
+-            }
+-        }
+-
+-
+-
+-        // rescale l and also reset rD to 0
+-        for (int i =0; i<2; i++) {
+-            rL[i] = FT_EXP(rM_old[i] - rM[i]) * rL_old[i];
+-            rD[i] = 0.0f;
+-        }
+-        // compute sum(sP)
+-
+-        // thread reduction
+-
+-        for (int i =0; i<2; i++) {
+-            for (int j=0; j < tSrS_float(make_coord(_,i),_,_).size(); j++) {
+-                rD[i] += tSrS_float(make_coord(_,i),_,_)[j];
+-            }
+-        }
+-
+-
+-
+-        // warp reduction
+-        for (int i =0; i<2; i++) {
+-            for (int offset = 2; offset > 0; offset /= 2) {
+-                rD[i] +=  __shfl_down_sync(mask, rD[i], offset);
+-            }
+-        }
+-
+-
+-
+-        for (int i =0; i<2; i++) {
+-            rL[i] += rD[i];
+-        }
+-
+-
+-
+-
+-        // sync rL
+-        for (int i =0; i<2; i++) {
+-            rL[i] = __shfl_sync(mask, rL[i], lane_id_to_read_from);
+-        }
+-
+-
+-
+-        Tensor tOrP = convert_type<half_t>(tSrS_float);
+-
+-
+-        // rescale O
+-
+-        for (int i =0; i<2; i++) {
+-            for (int j=0; j < tOrO_float(make_coord(_,i),_,_).size(); j++) {
+-                tOrO_float(make_coord(_,i),_,_)[j] = FT_EXP(rM_old[i] - rM[i]) * tOrO_float(make_coord(_,i),_,_)[j];
+-            }
+-        }
+-
+-
+-
+-        CUTE_UNROLL
+-        for (int pv_block = 0; pv_block < PV_BLOCK_MAX; pv_block++) {
+-            copy(s2r_tiled_copy_V, tOsV_copy_view(_,_,pv_block), tOrV_copy_view(_,_,pv_block));
+-
+-            gemm(tiled_mma, tOrP(_,_,pv_block), tOrV(_,_,pv_block), tOrO_float);
+-
+-        }
+-
+-        // update m and l
+-        for (int i = 0; i< 2;i++) {
+-            rM_old[i] = rM[i];
+-            rL_old[i] = rL[i];
+-        }
+-
+-#ifndef FLASH_TURING_SEPV
+-        // (SEPV: K and V live in different buffers, so the next K store cannot race with PV)
+-        __syncthreads();
+-#endif
+-
+-    }
+-
+-
+-
+-
+-    //copy(gmem_tiled_copy_QK, tKgK(_,_,_,n_block), tKrK);
+-    //copy(gmem_tiled_copy_V, tVgV(_,_,_,0), tVrV);
+-
+-
+-    // main loop
+-    CUTE_NO_UNROLL
+-    for (; n_block >= n_block_min; --n_block) {
+-
+-        copy(gmem_tiled_copy_QK, tKrK, tKsK);
+-        //copy(gmem_tiled_copy_V, tVrV, tVsV);
+-
+-        __syncthreads();
+-
+-        clear(tSrS_float);
+-
+-#ifdef FLASH_TURING_SEPV
+-        copy(gmem_tiled_copy_V, tVgV(_,_,_,n_block), tVrV);   // global -> registers
+-#endif
+-
+-        // if (n_block + 1 < n_block_no_mask) {
+-        //     copy(gmem_tiled_copy_QK, tKgK(_,_,_,n_block + 1), tKrK);
+-        //     //copy(gmem_tiled_copy_V, tVgV(_,_,_,kv_tile + 1), tVrV);
+-        // }
+-
+-
+-        if (n_block > n_block_min) {
+-            copy(gmem_tiled_copy_QK, tKgK(_,_,_,n_block - 1 ), tKrK);
+-        }
+-
+-        CUTE_UNROLL
+-        for (int qk_block = 0; qk_block < QK_BLOCK_MAX; qk_block++) {
+-            copy(s2r_tiled_copy_Q, tSsQ_copy_view(_,_,qk_block), tSrQ_copy_view(_,_,qk_block));
+-            copy(s2r_tiled_copy_K, tSsK_copy_view(_,_,qk_block), tSrK_copy_view(_,_,qk_block));
+-
+-            gemm(tiled_mma, tSrQ(_,_,qk_block), tSrK(_,_,qk_block), tSrS_float);
+-
+-        }
+-
+-#ifdef FLASH_TURING_SEPV
+-        copy(gmem_tiled_copy_V, tVrV, tVsV);   // registers -> sV (own buffer)
+-        __syncthreads();
+-#else
+-        __syncthreads();
+-        copy(gmem_tiled_copy_V, tVgV(_,_,_,n_block), tVsV);
+-        __syncthreads();
+-#endif
+-
+-
+-#ifndef FLASH_TURING_FASTSM
+-        for (int i=0;i< tSrS_float.size();i ++ ) {
+-            tSrS_float[i] *= softmax_scale;
+-        }
+-#endif
+-
+-
+-
+-        // compute m = rowmax(S)
+-        for (int i=0; i< 2; i++) {
+-            rM[i] = rM_old[i];
+-        }
+-
+-
+-        // intra-thread reduction
+-
+-        for (int i=0; i< 2; i++) {
+-            for (int j=0; j < tSrS_float(make_coord(_,i),_,_).size(); j++) {
+-                rM[i] = fmaxf(rM[i], tSrS_float(make_coord(_,i),_,_)[j]);
+-            }
+-        }
+-
+-
+-        // intra-warp reduction
+-        for (int i=0; i<2; i++) {
+-            for (int offset = 2; offset > 0; offset /= 2) {
+-               rM[i] = fmaxf(rM[i], __shfl_down_sync(mask, rM[i], offset));
+-            }
+-        }
+-
+-
+-        // sync rM
+-
+-        for (int i =0; i<2; i++) {
+-            rM[i] = __shfl_sync(mask, rM[i], lane_id_to_read_from);
+-        }
+-
+-
+-        // compute P = softmax(S)
+-        CUTE_UNROLL
+-        for (int i =0; i<2; i++) {
+-            //float max_scaled = rM[i] * float(M_LOG2E);
+-            CUTE_UNROLL
+-            for (int j=0; j < tSrS_float(make_coord(_,i),_,_).size(); j++) {
+-                tSrS_float(make_coord(_,i),_,_)[j] = FT_EXP(tSrS_float(make_coord(_,i),_,_)[j] - rM[i]);
+-                // using FMA instructions inside exp is slower
+-                //tSrS_float(make_coord(_,i),_,_)[j] = exp2f(tSrS_float(make_coord(_,i),_,_)[j] * float(M_LOG2E) - max_scaled);
+-            }
+-            
+-            rL[i] = FT_EXP(rM_old[i] - rM[i]) * rL_old[i];
+-            // rL[i] = exp2f(rM_old[i] * float(M_LOG2E) - max_scaled) * rL_old[i];
+-            rD[i] = 0.0f;
+-        }
+-
+-
+-
+-
+-
+-        // compute sum(sP)
+-
+-        // thread reduction
+-
+-        for (int i =0; i<2; i++) {
+-            for (int j=0; j < tSrS_float(make_coord(_,i),_,_).size(); j++) {
+-                rD[i] += tSrS_float(make_coord(_,i),_,_)[j];
+-            }
+-        }
+-
+-
+-
+-        // warp reduction
+-        for (int i =0; i<2; i++) {
+-            for (int offset = 2; offset > 0; offset /= 2) {
+-               rD[i] +=  __shfl_down_sync(mask, rD[i], offset);
+-            }
+-        }
+-
+-
+-
+-        for (int i =0; i<2; i++) {
+-            rL[i] += rD[i];
+-        }
+-
+-
+-        // sync rL
+-        for (int i =0; i<2; i++) {
+-            rL[i] = __shfl_sync(mask, rL[i], lane_id_to_read_from);
+-        }
+-
+-
+-
+-        Tensor tOrP = convert_type<half_t>(tSrS_float);
+-
+-
+-        // rescale O
+-
+-        for (int i =0; i<2; i++) {
+-            for (int j=0; j < tOrO_float(make_coord(_,i),_,_).size(); j++) {
+-                tOrO_float(make_coord(_,i),_,_)[j] = FT_EXP(rM_old[i] - rM[i]) * tOrO_float(make_coord(_,i),_,_)[j];
+-            }
+-        }
+-
+-
+-
+-        CUTE_UNROLL
+-        for (int pv_block = 0; pv_block < PV_BLOCK_MAX; pv_block++) {
+-            copy(s2r_tiled_copy_V, tOsV_copy_view(_,_,pv_block), tOrV_copy_view(_,_,pv_block));
+-
+-            gemm(tiled_mma, tOrP(_,_,pv_block), tOrV(_,_,pv_block), tOrO_float);
+-
+-        }
+-
+-
+-
+-        // update m and l
+-        for (int i = 0; i< 2;i++) {
+-            rM_old[i] = rM[i];
+-            rL_old[i] = rL[i];
+-        }
+-
+-
+-#ifndef FLASH_TURING_SEPV
+-        __syncthreads();
+-#endif
+-
+-    }
+-    // end of KV loop
+-
+-
+-
+-
+-    for (int i =0; i<2; i++) {
+-        // Sometimes the whole row of q might get masked out, for example where seqlen_q > seqlen_k,
+-        // in which case rL will be zero.
+-        if (rL[i] != 0.0f) {
+-            for (int j=0; j < tOrO_float(make_coord(_,i),_,_).size(); j++) {
+-                tOrO_float(make_coord(_,i),_,_)[j] /= rL[i];
+-            }
+-        } else {
+-            for (int j=0; j < tOrO_float(make_coord(_,i),_,_).size(); j++) {
+-                tOrO_float(make_coord(_,i),_,_)[j] = 0;
+-            }
+-        }
+-
+-    }
+-
+-
+-    Tensor tOrO = convert_type<half_t>(tOrO_float);
+-
+-    copy(tOrO, tOsO);
+-
+-    __syncthreads();
+-
+-    //copy(gmem_tiled_copy_O, tOsO_copy, tOgO_copy);
+-    masked_copy<Is_even_MN>(
+-        gmem_tiled_copy_O, tOsO_copy, tOgO_copy, tCqO, 
+-        seqlen_q - m_block * kBlockM, 
+-        /*clear_D=*/false);
+-
+-
+-    if (global_row_offset + thread_row < seqlen_q) {
+-        if (rL[0] == 0.0f) {
+-            gL[thread_row] = 0.0f;
+-        } else {
+-            gL[thread_row] = FT_LSE_M(rM[0]) + logf(rL[0]);
+-        }
+-
+-
+-    }
+-    if (global_row_offset + thread_row + 8 < seqlen_q) {
+-
+-        if (rL[1] == 0.0f) {
+-            gL[thread_row + 8] = 0.0f;
+-        } else {
+-            gL[thread_row + 8] = FT_LSE_M(rM[1]) + logf(rL[1]);
+-        }
+-
+-    }
+-
+-}
+-
+-
+-template<typename Kernel_traits, bool Is_causal, bool Is_even_MN>
+-inline __device__ void compute_attn(half_t* __restrict__ q,
+-                                      half_t* __restrict__ k,
+-                                      half_t* __restrict__ v,
+-                                      half_t* __restrict__ o,
+-                                      float* __restrict__ l,
+-                                      int* __restrict__ cu_seqlens_q,
+-                                      int* __restrict__ cu_seqlens_k,
+-                                      int batch_size,
+-                                      int seqlen_q,
+-                                      int seqlen_k,
+-                                      int num_heads,
+-                                      int num_heads_k,
+-                                      int h_h_k_ratio,
+-                                      int head_dim,
+-                                      float softmax_scale,
+-                                      int is_casual) {
+-    const int m_block = blockIdx.x;
+-    // The block index for the batch.
+-    const int bidb = blockIdx.y;
+-    // The block index for the head.
+-    const int bidh = blockIdx.z;
+-
+-    compute_attn_1rowblock<Kernel_traits, Is_causal, Is_even_MN>(q,
+-                                                    k,
+-                                                    v,
+-                                                    o,
+-                                                    l,
+-                                                    cu_seqlens_q,
+-                                                    cu_seqlens_k,
+-                                                    batch_size,
+-                                                    seqlen_q,
+-                                                    seqlen_k,
+-                                                    num_heads,
+-                                                    num_heads_k,
+-                                                    h_h_k_ratio,
+-                                                    head_dim,
+-                                                    softmax_scale,
+-                                                    is_casual,
+-                                                    bidb,
+-                                                    bidh,
+-                                                    m_block);
+-}
++#include <iostream>
++#include <cstdlib>
++#include <cstdio>
++#include <cassert>
++#include <float.h>
++#include <torch/extension.h>
++#include <cute/tensor.hpp>
++
++#include <cutlass/array.h>
++#include <cutlass/cutlass.h>
++#include <cutlass/numeric_conversion.h>
++#include <cutlass/numeric_types.h>
++
++#include "block_info.h"
++#include "kernel_traits.h"
++#include "utils.h"
++#include "mask.h"
++
++using namespace cute;
++
++// ---------------------------------------------------------------------------
++// Opt-in forward-kernel variants (see README_V2.md). With neither macro defined
++// this file compiles to exactly the V1 behaviour.
++//   FLASH_TURING_SEPV   separate smem buffer for V + V staged through registers
++//                       (hides V's global-load latency behind QK^T, 2 fewer
++//                       __syncthreads per KV iteration). Needs
++//                       (kBlockM + 2*kBlockN) * kHeadDim * 2 bytes of smem.
++//   FLASH_TURING_FASTSM softmax in the exp2 domain without the separate
++//                       S *= scale pass. Requires softmax_scale > 0.
++// ---------------------------------------------------------------------------
++#ifdef FLASH_TURING_FASTSM
++  // exp(scale * d) == exp2(d * scale * log2(e)); d <= 0 here.
++  #define FT_EXP(d)        exp2f((d) * scale_log2)
++  #define FT_LSE_M(m)      ((m) * softmax_scale)
++#else
++  #define FT_EXP(d)        expf(d)
++  #define FT_LSE_M(m)      (m)
++#endif
++
++
++// for some reason changing this into params struct is 15% slower for hdim = 128
++template <typename Kernel_traits, bool Is_causal, bool Is_even_MN>
++inline __device__ void compute_attn_1rowblock(
++                          const half_t* __restrict__ q,
++                          const half_t* __restrict__ k,
++                          const half_t* __restrict__ v,
++                          half_t* __restrict__ o,
++                          float* __restrict__ l,
++                          const int* __restrict__ cu_seqlens_q,
++                          const int* __restrict__ cu_seqlens_k,
++                          const int batch_size,
++                          const int max_seqlen_q,
++                          const int max_seqlen_k,
++                          const int num_heads,
++                          const int num_heads_k,
++                          const int h_h_k_ratio,
++                          const int head_dim,
++                          const float softmax_scale,
++                          const int is_casual,
++                          const int bidb,
++                          const int bidh,
++                          const int m_block)
++{
++
++    constexpr int kBlockM = Kernel_traits::kBlockM;
++    constexpr int kBlockN = Kernel_traits::kBlockN;
++    constexpr int kHeadDim = Kernel_traits::kHeadDim;
++
++
++    const BlockInfo</*Varlen=*/!Is_even_MN> binfo(max_seqlen_q, max_seqlen_k, bidb, cu_seqlens_q, cu_seqlens_k);
++    const int seqlen_q = binfo.actual_seqlen_q;
++    const int seqlen_k = binfo.actual_seqlen_k;
++
++
++    if (m_block * kBlockM >= seqlen_q) {
++        return;
++    }
++
++
++    Tensor mQ = make_tensor(make_gmem_ptr(q + binfo.q_offset(num_heads * head_dim, bidb)),
++                            make_shape(seqlen_q, num_heads, head_dim),
++                            make_stride(num_heads * head_dim, head_dim, Int<1>{}));
++
++    Tensor gQ = local_tile(mQ(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{},
++                           make_coord(m_block, 0));
++
++
++
++
++    Tensor mK = make_tensor(make_gmem_ptr(k + binfo.k_offset(num_heads_k * head_dim, bidb)),
++                            make_shape(seqlen_k, num_heads_k, head_dim),
++                            make_stride(num_heads_k * head_dim, head_dim, Int<1>{}));
++
++    Tensor gK = local_tile(mK(_, bidh / h_h_k_ratio, _), Shape<Int<kBlockN>, Int<kHeadDim>>{},
++                           make_coord(_, 0));
++
++
++
++    Tensor mV = make_tensor(make_gmem_ptr(v + binfo.k_offset(num_heads_k * head_dim, bidb)),
++                            make_shape(seqlen_k, num_heads_k, head_dim),
++                            make_stride(num_heads_k * head_dim, head_dim, Int<1>{}));
++
++    Tensor gV = local_tile(mV(_, bidh / h_h_k_ratio, _), Shape<Int<kBlockN>, Int<kHeadDim>>{},
++                           make_coord(_, 0));
++
++
++    Tensor mO = make_tensor(make_gmem_ptr(o + binfo.q_offset(num_heads * head_dim, bidb)),
++                            make_shape(seqlen_q, num_heads, head_dim),
++                            make_stride(num_heads * head_dim, head_dim, Int<1>{}));
++
++    Tensor gO = local_tile(mO(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{},
++                           make_coord(m_block, 0));
++
++    // L = m + log l
++    Tensor mL = make_tensor(make_gmem_ptr(reinterpret_cast<float*>(l)),
++                             make_shape(batch_size, num_heads, max_seqlen_q),
++                             make_stride(max_seqlen_q * num_heads, max_seqlen_q, Int<1>{}));
++
++    Tensor gL = local_tile(mL(bidb, bidh, _), Shape<Int<kBlockM>>{},
++                           make_coord(m_block));
++
++
++
++    extern __shared__ char smem_[];
++
++
++    Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<half_t*>(&smem_[0])), typename Kernel_traits::SmemLayoutQ{});
++    Tensor sK = make_tensor(sQ.data() + kBlockM*kHeadDim, typename Kernel_traits::SmemLayoutK{});
++#ifdef FLASH_TURING_SEPV
++    // Q | K | V, no aliasing between K and V
++    Tensor sV = make_tensor(sK.data() + kBlockN*kHeadDim, typename Kernel_traits::SmemLayoutV{});
++    Tensor sVt = make_tensor(sV.data(), typename Kernel_traits::SmemLayoutVTransposed{});
++#else
++    Tensor sV = make_tensor(sK.data(), typename Kernel_traits::SmemLayoutV{});
++    Tensor sVt = make_tensor(sK.data(), typename Kernel_traits::SmemLayoutVTransposed{});
++#endif
++    Tensor sO = make_tensor(make_smem_ptr(reinterpret_cast<half_t*>(&smem_[0])), typename Kernel_traits::SmemLayoutQ{});
++
++
++
++    const int lane_id = threadIdx.x % 32;
++    const int warp_id = threadIdx.x / 32;
++    const int thread_row = warp_id * 16 + lane_id / 4;
++    const int global_row_offset = m_block * kBlockM;
++
++#ifdef FLASH_TURING_FASTSM
++    const float scale_log2 = softmax_scale * 1.4426950408889634f;
++#endif
++    float rM_old[2] = {-FLT_MAX, -FLT_MAX};
++    float rM[2] = {0.0f};
++    float rL_old[2] = {0.0f};
++    float rL[2] = {0.0f};
++    // for storing rowsum(P)
++    float rD[2] = {0.0f};
++
++    unsigned mask;
++    if (lane_id < 4)       mask = 0x0000000F;  // Lanes  0 -  3
++    else if (lane_id < 8)  mask = 0x000000F0;  // Lanes  4 -  7
++    else if (lane_id < 12) mask = 0x00000F00;  // Lanes  8 - 11
++    else if (lane_id < 16) mask = 0x0000F000;  // Lanes 12 - 15
++    else if (lane_id < 20) mask = 0x000F0000;  // Lanes 16 - 19
++    else if (lane_id < 24) mask = 0x00F00000;  // Lanes 20 - 23
++    else if (lane_id < 28) mask = 0x0F000000;  // Lanes 24 - 27
++    else                   mask = 0xF0000000;  // Lanes 28 - 31
++
++
++    int lane_id_to_read_from;
++    if (lane_id < 4)       lane_id_to_read_from = 0;   // Lanes  0 -  3
++    else if (lane_id < 8)  lane_id_to_read_from = 4;   // Lanes  4 -  7
++    else if (lane_id < 12) lane_id_to_read_from = 8;   // Lanes  8 - 11
++    else if (lane_id < 16) lane_id_to_read_from = 12;  // Lanes 12 - 15
++    else if (lane_id < 20) lane_id_to_read_from = 16;  // Lanes 16 - 19
++    else if (lane_id < 24) lane_id_to_read_from = 20;  // Lanes 20 - 23
++    else if (lane_id < 28) lane_id_to_read_from = 24;  // Lanes 24 - 27
++    else                   lane_id_to_read_from = 28;  // Lanes 28 - 31
++
++    // gmem -> smem for Q, K, V
++    typename Kernel_traits::GmemTiledCopyQK gmem_tiled_copy_QK;
++    typename Kernel_traits::GmemTiledCopyV gmem_tiled_copy_V;
++    typename Kernel_traits::GmemTiledCopyO gmem_tiled_copy_O;
++
++    ThrCopy thr_copy_QK = gmem_tiled_copy_QK.get_slice(threadIdx.x);
++    Tensor tQgQ = thr_copy_QK.partition_S(gQ);
++    Tensor tQsQ = thr_copy_QK.partition_D(sQ);
++
++
++
++
++    Tensor tKgK = thr_copy_QK.partition_S(gK);
++    Tensor tKsK = thr_copy_QK.partition_D(sK);
++    Tensor tKrK = make_fragment_like(tKsK);
++
++
++    ThrCopy thr_copy_V = gmem_tiled_copy_V.get_slice(threadIdx.x);
++    Tensor tVgV = thr_copy_V.partition_S(gV);
++    Tensor tVsV = thr_copy_V.partition_D(sV);
++    Tensor tVrV = make_fragment_like(tVsV);
++
++    // smem -> gmem for O
++    ThrCopy thr_copy_O = gmem_tiled_copy_O.get_slice(threadIdx.x);
++    Tensor tOsO_copy = thr_copy_O.partition_S(sO);
++    Tensor tOgO_copy = thr_copy_O.partition_D(gO);
++
++    // Identity tensors for bound-checking the masked copies
++    Tensor cQ_identity = make_identity_tensor(make_shape(Int<kBlockM>{}, Int<kHeadDim>{}));
++    Tensor cK_identity = make_identity_tensor(make_shape(Int<kBlockN>{}, Int<kHeadDim>{}));
++    auto tCqQ = thr_copy_QK.partition_S(cQ_identity);
++    auto tCqK = thr_copy_QK.partition_S(cK_identity);
++    auto tCqO = thr_copy_O.partition_S(cQ_identity);
++
++
++    typename Kernel_traits::TiledMma tiled_mma;
++
++    // mma for S = QK^T
++    ThrMMA thr_mma_S = tiled_mma.get_slice(threadIdx.x);
++    Tensor tSsQ = thr_mma_S.partition_A(sQ);
++    Tensor tSsK = thr_mma_S.partition_B(sK);
++
++    Tensor tSrQ = thr_mma_S.make_fragment_A(tSsQ);
++    Tensor tSrK = thr_mma_S.make_fragment_B(tSsK);
++    Tensor tSrS_float = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});
++
++
++    // mma for O = PV
++    ThrMMA thr_mma_O = tiled_mma.get_slice(threadIdx.x);
++    Tensor tOsV = thr_mma_O.partition_B(sVt);
++    Tensor tOrV = thr_mma_O.make_fragment_B(tOsV);
++    Tensor tOrO_float = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kHeadDim>>{});
++    Tensor tOsO = thr_mma_O.partition_C(sO);
++
++
++
++
++    //  each warp only process 16 rows
++    auto s2r_tiled_copy_Q = make_tiled_copy_A(typename Kernel_traits::SmemCopyAtomQ{}, tiled_mma);
++    auto s2r_thr_copy_Q = s2r_tiled_copy_Q.get_slice(threadIdx.x);
++    auto tSsQ_copy_view = s2r_thr_copy_Q.partition_S(sQ);
++    auto tSrQ_copy_view = s2r_thr_copy_Q.retile_D(tSrQ);
++
++    auto s2r_tiled_copy_K = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtomK{}, tiled_mma);
++    auto s2r_thr_copy_K = s2r_tiled_copy_K.get_slice(threadIdx.x);
++    auto tSsK_copy_view = s2r_thr_copy_K.partition_S(sK);
++    auto tSrK_copy_view = s2r_thr_copy_K.retile_D(tSrK);
++
++    // auto s2r_tiled_copy_V = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtomV{}, tiled_mma);
++    auto s2r_tiled_copy_V = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtomVt{}, tiled_mma);
++    auto s2r_thr_copy_V = s2r_tiled_copy_V.get_slice(threadIdx.x);
++    auto tOsV_copy_view = s2r_thr_copy_V.partition_S(sVt);
++    auto tOrV_copy_view = s2r_thr_copy_V.retile_D(tOrV);
++
++    const int n_block_min = 0;
++    int m_block_max = ceil_div(seqlen_q, kBlockM);
++    int n_block_max = ceil_div(seqlen_k, kBlockN);
++
++
++    int n_masking_steps = (!Is_causal)
++        ? 1
++        : ((Is_even_MN && Is_causal) ? ceil_div(kBlockM, kBlockN) : ceil_div(kBlockM, kBlockN) + 1);
++
++    int causal_offset = 0;
++    int is_even_mn_offset = 0;
++
++    if constexpr(Is_causal) {
++
++        n_block_max = fmaxf(0, ceil_div((m_block + 1) * kBlockM + seqlen_k - seqlen_q, kBlockN));
++        n_masking_steps = fminf(n_masking_steps, n_block_max);
++
++        causal_offset = seqlen_k - seqlen_q - (n_block_max - 1) * kBlockN + m_block * kBlockM;         
++
++    }        
++
++    is_even_mn_offset = seqlen_k - (n_block_max - 1) * kBlockN;
++    
++    // if seqlen_q > seqlen_k we exit early for the blocks with rows that are fully masked
++    if (n_block_max == 0) {return;}
++
++    auto QK_BLOCK_MAX = size<2>(tSsK);
++    auto PV_BLOCK_MAX = size<2>(tOsV);
++
++
++    clear(tOrO_float);
++    
++    // prologue
++
++    // copy(gmem_tiled_copy_QK, tQgQ, tQsQ);
++    masked_copy<Is_even_MN>(
++        gmem_tiled_copy_QK, tQgQ, tQsQ, tCqQ, 
++        seqlen_q - m_block * kBlockM, 
++        /*clear_D=*/true);
++
++
++
++    int n_block = n_block_max - 1;
++
++
++    // these are the blocks that need masking
++    
++    Mask<Is_causal> accum_s_mask(seqlen_q, seqlen_k);
++    // constexpr bool Is_even_MN = true; 
++
++    masked_copy<Is_even_MN>(
++        gmem_tiled_copy_QK, tKgK(_,_,_,n_block), tKrK, tCqK, 
++        seqlen_k - n_block * kBlockN,
++        /*clear_D=*/true);
++    //copy(gmem_tiled_copy_QK, tKgK(_,_,_,n_block), tKrK);
++    for (int masking_step = 0; masking_step < n_masking_steps; ++masking_step, --n_block) {
++
++        copy(gmem_tiled_copy_QK, tKrK, tKsK);
++
++        __syncthreads();
++
++        clear(tSrS_float);
++
++#ifdef FLASH_TURING_SEPV
++        // V(n): global -> registers now (latency hidden behind the QK^T MMAs below)
++        masked_copy<Is_even_MN>(
++            gmem_tiled_copy_QK, tVgV(_,_,_,n_block), tVrV, tCqK,
++            seqlen_k - n_block * kBlockN,
++            /*clear_D=*/true);
++#endif
++
++        // if (n_block + 1 < n_block_max) {
++        //     copy(gmem_tiled_copy_QK, tKgK(_,_,_,n_block + 1), tKrK);
++        // }
++
++
++        if (n_block > n_block_min) {
++
++            masked_copy<Is_even_MN>(
++                gmem_tiled_copy_QK, tKgK(_,_,_,n_block-1), tKrK, tCqK, 
++                seqlen_k - (n_block-1) * kBlockN,
++                /*clear_D=*/true);
++            // copy(gmem_tiled_copy_QK, tKgK(_,_,_,n_block - 1 ), tKrK);
++        }
++
++        CUTE_UNROLL
++        for (int qk_block = 0; qk_block < QK_BLOCK_MAX; qk_block++) {
++            copy(s2r_tiled_copy_Q, tSsQ_copy_view(_,_,qk_block), tSrQ_copy_view(_,_,qk_block));
++            copy(s2r_tiled_copy_K, tSsK_copy_view(_,_,qk_block), tSrK_copy_view(_,_,qk_block));
++
++            gemm(tiled_mma, tSrQ(_,_,qk_block), tSrK(_,_,qk_block), tSrS_float);
++
++        }
++
++#ifdef FLASH_TURING_SEPV
++        copy(gmem_tiled_copy_V, tVrV, tVsV);   // registers -> sV (own buffer)
++        __syncthreads();
++#else
++        __syncthreads();
++        masked_copy<Is_even_MN>(
++            gmem_tiled_copy_QK, tVgV(_,_,_,n_block), tVsV, tCqK, 
++            seqlen_k - n_block * kBlockN,
++            /*clear_D=*/true);
++
++        // copy(gmem_tiled_copy_V, tVgV(_,_,_,n_block), tVsV);
++        __syncthreads();
++#endif
++
++
++#ifndef FLASH_TURING_FASTSM
++        // for now we rescale before we apply causal mask
++        for (int i=0;i< tSrS_float.size();i ++ ) {
++            tSrS_float[i] *= softmax_scale;
++        }
++#endif
++
++   
++        accum_s_mask.template apply_mask_fwd<Is_causal, Is_even_MN>(
++            tSrS_float, 
++            warp_id, 
++            lane_id,             
++            kBlockN,              
++            causal_offset,
++            is_even_mn_offset
++        );
++
++
++
++        // compute m = rowmax(S)
++        for (int i=0; i< 2; i++) {
++            rM[i] = rM_old[i];
++        }
++
++
++        // intra-thread reduction
++
++        for (int i=0; i< 2; i++) {
++            for (int j=0; j < tSrS_float(make_coord(_,i),_,_).size(); j++) {
++                rM[i] = fmaxf(rM[i], tSrS_float(make_coord(_,i),_,_)[j]);
++            }
++        }
++
++
++        // intra-warp reduction
++        for (int i=0; i<2; i++) {
++            for (int offset = 2; offset > 0; offset /= 2) {
++                rM[i] = fmaxf(rM[i], __shfl_down_sync(mask, rM[i], offset));
++            }
++        }
++
++
++        // sync rM
++
++        for (int i =0; i<2; i++) {
++            rM[i] = __shfl_sync(mask, rM[i], lane_id_to_read_from);
++        }
++
++
++
++        // compute P = softmax(S)
++        for (int i =0; i<2; i++) {
++            for (int j=0; j < tSrS_float(make_coord(_,i),_,_).size(); j++) {
++                if (rM[i] == -FLT_MAX) {
++                    tSrS_float(make_coord(_,i),_,_)[j] = 0.0f;
++                } else {
++                    tSrS_float(make_coord(_,i),_,_)[j] = FT_EXP(tSrS_float(make_coord(_,i),_,_)[j] - rM[i]);
++                }
++
++            }
++        }
++
++
++
++        // rescale l and also reset rD to 0
++        for (int i =0; i<2; i++) {
++            rL[i] = FT_EXP(rM_old[i] - rM[i]) * rL_old[i];
++            rD[i] = 0.0f;
++        }
++        // compute sum(sP)
++
++        // thread reduction
++
++        for (int i =0; i<2; i++) {
++            for (int j=0; j < tSrS_float(make_coord(_,i),_,_).size(); j++) {
++                rD[i] += tSrS_float(make_coord(_,i),_,_)[j];
++            }
++        }
++
++
++
++        // warp reduction
++        for (int i =0; i<2; i++) {
++            for (int offset = 2; offset > 0; offset /= 2) {
++                rD[i] +=  __shfl_down_sync(mask, rD[i], offset);
++            }
++        }
++
++
++
++        for (int i =0; i<2; i++) {
++            rL[i] += rD[i];
++        }
++
++
++
++
++        // sync rL
++        for (int i =0; i<2; i++) {
++            rL[i] = __shfl_sync(mask, rL[i], lane_id_to_read_from);
++        }
++
++
++
++        Tensor tOrP = convert_type<half_t>(tSrS_float);
++
++
++        // rescale O
++
++        for (int i =0; i<2; i++) {
++            for (int j=0; j < tOrO_float(make_coord(_,i),_,_).size(); j++) {
++                tOrO_float(make_coord(_,i),_,_)[j] = FT_EXP(rM_old[i] - rM[i]) * tOrO_float(make_coord(_,i),_,_)[j];
++            }
++        }
++
++
++
++        CUTE_UNROLL
++        for (int pv_block = 0; pv_block < PV_BLOCK_MAX; pv_block++) {
++            copy(s2r_tiled_copy_V, tOsV_copy_view(_,_,pv_block), tOrV_copy_view(_,_,pv_block));
++
++            gemm(tiled_mma, tOrP(_,_,pv_block), tOrV(_,_,pv_block), tOrO_float);
++
++        }
++
++        // update m and l
++        for (int i = 0; i< 2;i++) {
++            rM_old[i] = rM[i];
++            rL_old[i] = rL[i];
++        }
++
++#ifndef FLASH_TURING_SEPV
++        // (SEPV: K and V live in different buffers, so the next K store cannot race with PV)
++        __syncthreads();
++#endif
++
++    }
++
++
++
++
++    //copy(gmem_tiled_copy_QK, tKgK(_,_,_,n_block), tKrK);
++    //copy(gmem_tiled_copy_V, tVgV(_,_,_,0), tVrV);
++
++
++    // main loop
++    CUTE_NO_UNROLL
++    for (; n_block >= n_block_min; --n_block) {
++
++        copy(gmem_tiled_copy_QK, tKrK, tKsK);
++        //copy(gmem_tiled_copy_V, tVrV, tVsV);
++
++        __syncthreads();
++
++        clear(tSrS_float);
++
++#ifdef FLASH_TURING_SEPV
++        copy(gmem_tiled_copy_V, tVgV(_,_,_,n_block), tVrV);   // global -> registers
++#endif
++
++        // if (n_block + 1 < n_block_no_mask) {
++        //     copy(gmem_tiled_copy_QK, tKgK(_,_,_,n_block + 1), tKrK);
++        //     //copy(gmem_tiled_copy_V, tVgV(_,_,_,kv_tile + 1), tVrV);
++        // }
++
++
++        if (n_block > n_block_min) {
++            copy(gmem_tiled_copy_QK, tKgK(_,_,_,n_block - 1 ), tKrK);
++        }
++
++        CUTE_UNROLL
++        for (int qk_block = 0; qk_block < QK_BLOCK_MAX; qk_block++) {
++            copy(s2r_tiled_copy_Q, tSsQ_copy_view(_,_,qk_block), tSrQ_copy_view(_,_,qk_block));
++            copy(s2r_tiled_copy_K, tSsK_copy_view(_,_,qk_block), tSrK_copy_view(_,_,qk_block));
++
++            gemm(tiled_mma, tSrQ(_,_,qk_block), tSrK(_,_,qk_block), tSrS_float);
++
++        }
++
++#ifdef FLASH_TURING_SEPV
++        copy(gmem_tiled_copy_V, tVrV, tVsV);   // registers -> sV (own buffer)
++        __syncthreads();
++#else
++        __syncthreads();
++        copy(gmem_tiled_copy_V, tVgV(_,_,_,n_block), tVsV);
++        __syncthreads();
++#endif
++
++
++#ifndef FLASH_TURING_FASTSM
++        for (int i=0;i< tSrS_float.size();i ++ ) {
++            tSrS_float[i] *= softmax_scale;
++        }
++#endif
++
++
++
++        // compute m = rowmax(S)
++        for (int i=0; i< 2; i++) {
++            rM[i] = rM_old[i];
++        }
++
++
++        // intra-thread reduction
++
++        for (int i=0; i< 2; i++) {
++            for (int j=0; j < tSrS_float(make_coord(_,i),_,_).size(); j++) {
++                rM[i] = fmaxf(rM[i], tSrS_float(make_coord(_,i),_,_)[j]);
++            }
++        }
++
++
++        // intra-warp reduction
++        for (int i=0; i<2; i++) {
++            for (int offset = 2; offset > 0; offset /= 2) {
++               rM[i] = fmaxf(rM[i], __shfl_down_sync(mask, rM[i], offset));
++            }
++        }
++
++
++        // sync rM
++
++        for (int i =0; i<2; i++) {
++            rM[i] = __shfl_sync(mask, rM[i], lane_id_to_read_from);
++        }
++
++
++        // compute P = softmax(S)
++        CUTE_UNROLL
++        for (int i =0; i<2; i++) {
++            //float max_scaled = rM[i] * float(M_LOG2E);
++            CUTE_UNROLL
++            for (int j=0; j < tSrS_float(make_coord(_,i),_,_).size(); j++) {
++                tSrS_float(make_coord(_,i),_,_)[j] = FT_EXP(tSrS_float(make_coord(_,i),_,_)[j] - rM[i]);
++                // using FMA instructions inside exp is slower
++                //tSrS_float(make_coord(_,i),_,_)[j] = exp2f(tSrS_float(make_coord(_,i),_,_)[j] * float(M_LOG2E) - max_scaled);
++            }
++            
++            rL[i] = FT_EXP(rM_old[i] - rM[i]) * rL_old[i];
++            // rL[i] = exp2f(rM_old[i] * float(M_LOG2E) - max_scaled) * rL_old[i];
++            rD[i] = 0.0f;
++        }
++
++
++
++
++
++        // compute sum(sP)
++
++        // thread reduction
++
++        for (int i =0; i<2; i++) {
++            for (int j=0; j < tSrS_float(make_coord(_,i),_,_).size(); j++) {
++                rD[i] += tSrS_float(make_coord(_,i),_,_)[j];
++            }
++        }
++
++
++
++        // warp reduction
++        for (int i =0; i<2; i++) {
++            for (int offset = 2; offset > 0; offset /= 2) {
++               rD[i] +=  __shfl_down_sync(mask, rD[i], offset);
++            }
++        }
++
++
++
++        for (int i =0; i<2; i++) {
++            rL[i] += rD[i];
++        }
++
++
++        // sync rL
++        for (int i =0; i<2; i++) {
++            rL[i] = __shfl_sync(mask, rL[i], lane_id_to_read_from);
++        }
++
++
++
++        Tensor tOrP = convert_type<half_t>(tSrS_float);
++
++
++        // rescale O
++
++        for (int i =0; i<2; i++) {
++            for (int j=0; j < tOrO_float(make_coord(_,i),_,_).size(); j++) {
++                tOrO_float(make_coord(_,i),_,_)[j] = FT_EXP(rM_old[i] - rM[i]) * tOrO_float(make_coord(_,i),_,_)[j];
++            }
++        }
++
++
++
++        CUTE_UNROLL
++        for (int pv_block = 0; pv_block < PV_BLOCK_MAX; pv_block++) {
++            copy(s2r_tiled_copy_V, tOsV_copy_view(_,_,pv_block), tOrV_copy_view(_,_,pv_block));
++
++            gemm(tiled_mma, tOrP(_,_,pv_block), tOrV(_,_,pv_block), tOrO_float);
++
++        }
++
++
++
++        // update m and l
++        for (int i = 0; i< 2;i++) {
++            rM_old[i] = rM[i];
++            rL_old[i] = rL[i];
++        }
++
++
++#ifndef FLASH_TURING_SEPV
++        __syncthreads();
++#endif
++
++    }
++    // end of KV loop
++
++
++
++
++    for (int i =0; i<2; i++) {
++        // Sometimes the whole row of q might get masked out, for example where seqlen_q > seqlen_k,
++        // in which case rL will be zero.
++        if (rL[i] != 0.0f) {
++            for (int j=0; j < tOrO_float(make_coord(_,i),_,_).size(); j++) {
++                tOrO_float(make_coord(_,i),_,_)[j] /= rL[i];
++            }
++        } else {
++            for (int j=0; j < tOrO_float(make_coord(_,i),_,_).size(); j++) {
++                tOrO_float(make_coord(_,i),_,_)[j] = 0;
++            }
++        }
++
++    }
++
++
++    Tensor tOrO = convert_type<half_t>(tOrO_float);
++
++    copy(tOrO, tOsO);
++
++    __syncthreads();
++
++    //copy(gmem_tiled_copy_O, tOsO_copy, tOgO_copy);
++    masked_copy<Is_even_MN>(
++        gmem_tiled_copy_O, tOsO_copy, tOgO_copy, tCqO, 
++        seqlen_q - m_block * kBlockM, 
++        /*clear_D=*/false);
++
++
++    if (global_row_offset + thread_row < seqlen_q) {
++        if (rL[0] == 0.0f) {
++            gL[thread_row] = 0.0f;
++        } else {
++            gL[thread_row] = FT_LSE_M(rM[0]) + logf(rL[0]);
++        }
++
++
++    }
++    if (global_row_offset + thread_row + 8 < seqlen_q) {
++
++        if (rL[1] == 0.0f) {
++            gL[thread_row + 8] = 0.0f;
++        } else {
++            gL[thread_row + 8] = FT_LSE_M(rM[1]) + logf(rL[1]);
++        }
++
++    }
++
++}
++
++
++template<typename Kernel_traits, bool Is_causal, bool Is_even_MN>
++inline __device__ void compute_attn(half_t* __restrict__ q,
++                                      half_t* __restrict__ k,
++                                      half_t* __restrict__ v,
++                                      half_t* __restrict__ o,
++                                      float* __restrict__ l,
++                                      int* __restrict__ cu_seqlens_q,
++                                      int* __restrict__ cu_seqlens_k,
++                                      int batch_size,
++                                      int seqlen_q,
++                                      int seqlen_k,
++                                      int num_heads,
++                                      int num_heads_k,
++                                      int h_h_k_ratio,
++                                      int head_dim,
++                                      float softmax_scale,
++                                      int is_casual) {
++#ifdef FLASH_TURING_CAUSAL_REVERSE
++    // V2.3: causal row blocks near the bottom do the most work; launch them first so the
++    // light blocks fill the tail of the last wave. Every CTA is independent, so only the
++    // schedule changes, not the result.
++    const int m_block = Is_causal ? (int(gridDim.x) - 1 - int(blockIdx.x)) : int(blockIdx.x);
++#else
++    const int m_block = blockIdx.x;
++#endif
++    // The block index for the batch.
++    const int bidb = blockIdx.y;
++    // The block index for the head.
++    const int bidh = blockIdx.z;
++
++    compute_attn_1rowblock<Kernel_traits, Is_causal, Is_even_MN>(q,
++                                                    k,
++                                                    v,
++                                                    o,
++                                                    l,
++                                                    cu_seqlens_q,
++                                                    cu_seqlens_k,
++                                                    batch_size,
++                                                    seqlen_q,
++                                                    seqlen_k,
++                                                    num_heads,
++                                                    num_heads_k,
++                                                    h_h_k_ratio,
++                                                    head_dim,
++                                                    softmax_scale,
++                                                    is_casual,
++                                                    bidb,
++                                                    bidh,
++                                                    m_block);
++}
+diff -ruN ./csrc/flash_attn/src/flash_fwd_launch_template.h /mnt/data/_build_v23_hotfix/flashattn_turing_v23_small_tile_candidate_fixed/source_overlay_v23/csrc/flash_attn/src/flash_fwd_launch_template.h
+--- ./csrc/flash_attn/src/flash_fwd_launch_template.h	2026-11-09 13:12:43.064279854 +0000
++++ /mnt/data/_build_v23_hotfix/flashattn_turing_v23_small_tile_candidate_fixed/source_overlay_v23/csrc/flash_attn/src/flash_fwd_launch_template.h	2026-11-09 13:09:29.573466378 +0000
+@@ -1,159 +1,169 @@
+-
+-#pragma once
+-#include <c10/cuda/CUDAException.h>
+-#include <c10/cuda/CUDAStream.h>
+-#include "flash.h"
+-#include "flash_fwd_kernel.h"
+-#include <cutlass/numeric_types.h>
+-#include "static_switch.h"
+-#include <atomic>
+-using half_t = cutlass::half_t;
+-
+-template <typename Kernel_traits, bool Is_causal, bool Is_even_MN>
+-__global__ __launch_bounds__(256)
+-// for some reason changing this into params struc is 10% slower for hdim = 128
+-void flash_fwd_kernel(half_t* __restrict__ q,
+-                          half_t* __restrict__ k,
+-                          half_t* __restrict__ v,
+-                          half_t* __restrict__ o,
+-                          float* __restrict__ l,
+-                          int* __restrict__ cu_seqlens_q,
+-                          int* __restrict__ cu_seqlens_k,
+-                          int batch_size,
+-                          int seqlen_q,
+-                          int seqlen_k,
+-                          int num_heads,
+-                          int num_heads_k,
+-                          int h_h_k_ratio,
+-                          int head_dim,
+-                          float softmax_scale,
+-                          int is_casual)
+-{
+-    compute_attn<Kernel_traits, Is_causal, Is_even_MN>(q,
+-                                           k,
+-                                           v,
+-                                           o,
+-                                           l,
+-                                           cu_seqlens_q,
+-                                           cu_seqlens_k,
+-                                           batch_size,
+-                                           seqlen_q,
+-                                           seqlen_k,
+-                                           num_heads,
+-                                           num_heads_k,
+-                                           h_h_k_ratio,
+-                                           head_dim,
+-                                           softmax_scale,
+-                                           is_casual);
+-}
+-
+-template<typename Kernel_traits, bool Is_causal>
+-void run_flash_fwd(Flash_fwd_params &params) {
+-    auto stream = c10::cuda::getCurrentCUDAStream().stream();
+-
+-
+-    //auto kernel = flash_fwd_kernel<Kernel_traits, Is_causal>;
+-
+-    constexpr int kBlockM = Kernel_traits::kBlockM;
+-    constexpr int kBlockN = Kernel_traits::kBlockN;
+-
+-    const int num_m_block = (params.seqlen_q + kBlockM - 1) / kBlockM;
+-
+-    const bool is_even_MN  = params.cu_seqlens_q == nullptr &&
+-                             params.cu_seqlens_k == nullptr &&
+-                             params.seqlen_q % kBlockM == 0 &&
+-                             params.seqlen_k % kBlockN == 0;
+-
+-    dim3 dimGrid(num_m_block, params.b, params.h);
+-    dim3 dimBlock(256);
+-
+-    // Exact dynamic smem: sQ (kBlockM x D) + sK (kBlockN x D) [+ sV (kBlockN x D) with SEPV].
+-    // (V1 always requested 64 KB, which pinned occupancy at 1 CTA/SM even for small tiles.)
+-#ifdef FLASH_TURING_SEPV
+-    constexpr int kSmemTiles = kBlockM + 2 * kBlockN;
+-#else
+-    constexpr int kSmemTiles = kBlockM + kBlockN;
+-#endif
+-    constexpr int maxbytes = kSmemTiles * Kernel_traits::kHeadDim * int(sizeof(half_t));
+-    static_assert(maxbytes <= 65536, "forward tile does not fit in 64 KB of shared memory on SM75");
+-
+-    int dev = 0;
+-    C10_CUDA_CHECK(cudaGetDevice(&dev));
+-
+-    BOOL_SWITCH(is_even_MN, Is_even_MN, [&] {
+-        // cudaFuncSetAttribute is a host-side driver call; do it once per (kernel, device), not per launch.
+-        static std::atomic<bool> smem_attr_set[16];
+-        if (dev < 0 || dev >= 16 || !smem_attr_set[dev].load(std::memory_order_relaxed)) {
+-            C10_CUDA_CHECK(cudaFuncSetAttribute(
+-                flash_fwd_kernel<Kernel_traits, Is_causal, Is_even_MN>,
+-                cudaFuncAttributeMaxDynamicSharedMemorySize, maxbytes));
+-            if (dev >= 0 && dev < 16) smem_attr_set[dev].store(true, std::memory_order_relaxed);
+-        }
+-        flash_fwd_kernel<Kernel_traits, Is_causal, Is_even_MN><<<dimGrid, dimBlock, maxbytes, stream>>>(params.q_ptr,
+-                                                                                    params.k_ptr,
+-                                                                                    params.v_ptr,
+-                                                                                    params.o_ptr,
+-                                                                                    params.l_ptr,
+-                                                                                    params.cu_seqlens_q,
+-                                                                                    params.cu_seqlens_k,
+-                                                                                    params.b,
+-                                                                                    params.seqlen_q,
+-                                                                                    params.seqlen_k,
+-                                                                                    params.h,
+-                                                                                    params.h_k,
+-                                                                                    params.h_h_k_ratio,
+-                                                                                    params.d,
+-                                                                                    params.softmax_scale,
+-                                                                                    params.is_causal);
+-        C10_CUDA_KERNEL_LAUNCH_CHECK();
+-
+-    });
+-
+-}
+-
+-
+-
+-template<bool Is_causal>
+-void run_mha_fwd_hdim32(Flash_fwd_params &params) {
+-    constexpr static int Headdim = 32;
+-    constexpr static int kBlockM = 128;
+-    constexpr static int kBlockN = 128;
+-    constexpr static int kNWarps = 8;
+-    run_flash_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, kNWarps>, Is_causal>(params);
+-}
+-
+-
+-template<bool Is_causal>
+-void run_mha_fwd_hdim128(Flash_fwd_params &params) {
+-    constexpr static int Headdim = 128;
+-    constexpr static int kBlockM = 128;
+-    constexpr static int kBlockN = 64;
+-    constexpr static int kNWarps = 8;
+-    run_flash_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, kNWarps>, Is_causal>(params);
+-
+-
+-}
+-
+-
+-template<bool Is_causal>
+-void run_mha_fwd_hdim96(Flash_fwd_params &params) {
+-    constexpr static int Headdim = 96;
+-    constexpr static int kBlockM = 128;
+-    constexpr static int kBlockN = 64;
+-    constexpr static int kNWarps = 8;
+-    run_flash_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, kNWarps>, Is_causal>(params);
+-
+-
+-}
+-
+-
+-template<bool Is_causal>
+-void run_mha_fwd_hdim64(Flash_fwd_params &params) {
+-    constexpr static int Headdim = 64;
+-    constexpr static int kBlockM = 128;
+-    constexpr static int kBlockN = 128;
+-    constexpr static int kNWarps = 8;
+-    run_flash_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, kNWarps>, Is_causal>(params);
+-
+-
+-}
++
++#pragma once
++#include <c10/cuda/CUDAException.h>
++#include <c10/cuda/CUDAStream.h>
++#include "flash.h"
++#include "flash_fwd_kernel.h"
++#include <cutlass/numeric_types.h>
++#include "static_switch.h"
++#include "flash_fwd_tiles.h"
++#include <atomic>
++using half_t = cutlass::half_t;
++
++template <typename Kernel_traits, bool Is_causal, bool Is_even_MN>
++__global__ __launch_bounds__(Kernel_traits::kNThreads)
++// for some reason changing this into params struc is 10% slower for hdim = 128
++void flash_fwd_kernel(half_t* __restrict__ q,
++                          half_t* __restrict__ k,
++                          half_t* __restrict__ v,
++                          half_t* __restrict__ o,
++                          float* __restrict__ l,
++                          int* __restrict__ cu_seqlens_q,
++                          int* __restrict__ cu_seqlens_k,
++                          int batch_size,
++                          int seqlen_q,
++                          int seqlen_k,
++                          int num_heads,
++                          int num_heads_k,
++                          int h_h_k_ratio,
++                          int head_dim,
++                          float softmax_scale,
++                          int is_casual)
++{
++    compute_attn<Kernel_traits, Is_causal, Is_even_MN>(q,
++                                           k,
++                                           v,
++                                           o,
++                                           l,
++                                           cu_seqlens_q,
++                                           cu_seqlens_k,
++                                           batch_size,
++                                           seqlen_q,
++                                           seqlen_k,
++                                           num_heads,
++                                           num_heads_k,
++                                           h_h_k_ratio,
++                                           head_dim,
++                                           softmax_scale,
++                                           is_casual);
++}
++
++template<typename Kernel_traits, bool Is_causal>
++void run_flash_fwd(Flash_fwd_params &params) {
++    auto stream = c10::cuda::getCurrentCUDAStream().stream();
++
++
++    //auto kernel = flash_fwd_kernel<Kernel_traits, Is_causal>;
++
++    constexpr int kBlockM = Kernel_traits::kBlockM;
++    constexpr int kBlockN = Kernel_traits::kBlockN;
++
++    const int num_m_block = (params.seqlen_q + kBlockM - 1) / kBlockM;
++
++    const bool is_even_MN  = params.cu_seqlens_q == nullptr &&
++                             params.cu_seqlens_k == nullptr &&
++                             params.seqlen_q % kBlockM == 0 &&
++                             params.seqlen_k % kBlockN == 0;
++
++    dim3 dimGrid(num_m_block, params.b, params.h);
++    dim3 dimBlock(Kernel_traits::kNThreads);
++
++    // Exact dynamic smem: sQ (kBlockM x D) + sK (kBlockN x D) [+ sV (kBlockN x D) with SEPV].
++    // (V1 always requested 64 KB, which pinned occupancy at 1 CTA/SM even for small tiles.)
++#ifdef FLASH_TURING_SEPV
++    constexpr int kSmemTiles = kBlockM + 2 * kBlockN;
++#else
++    constexpr int kSmemTiles = kBlockM + kBlockN;
++#endif
++    constexpr int maxbytes = kSmemTiles * Kernel_traits::kHeadDim * int(sizeof(half_t));
++    static_assert(maxbytes <= 65536, "forward tile does not fit in 64 KB of shared memory on SM75");
++
++    int dev = 0;
++    C10_CUDA_CHECK(cudaGetDevice(&dev));
++
++    BOOL_SWITCH(is_even_MN, Is_even_MN, [&] {
++        // cudaFuncSetAttribute is a host-side driver call; do it once per (kernel, device), not per launch.
++        static std::atomic<bool> smem_attr_set[16];
++        if (dev < 0 || dev >= 16 || !smem_attr_set[dev].load(std::memory_order_relaxed)) {
++            C10_CUDA_CHECK(cudaFuncSetAttribute(
++                flash_fwd_kernel<Kernel_traits, Is_causal, Is_even_MN>,
++                cudaFuncAttributeMaxDynamicSharedMemorySize, maxbytes));
++            if (dev >= 0 && dev < 16) smem_attr_set[dev].store(true, std::memory_order_relaxed);
++        }
++        flash_fwd_kernel<Kernel_traits, Is_causal, Is_even_MN><<<dimGrid, dimBlock, maxbytes, stream>>>(params.q_ptr,
++                                                                                    params.k_ptr,
++                                                                                    params.v_ptr,
++                                                                                    params.o_ptr,
++                                                                                    params.l_ptr,
++                                                                                    params.cu_seqlens_q,
++                                                                                    params.cu_seqlens_k,
++                                                                                    params.b,
++                                                                                    params.seqlen_q,
++                                                                                    params.seqlen_k,
++                                                                                    params.h,
++                                                                                    params.h_k,
++                                                                                    params.h_h_k_ratio,
++                                                                                    params.d,
++                                                                                    params.softmax_scale,
++                                                                                    params.is_causal);
++        C10_CUDA_KERNEL_LAUNCH_CHECK();
++
++    });
++
++}
++
++
++
++// V2.3: smaller-M variants (kBlockM = 16 * kNWarps) of the same kernel, for grids that would
++// otherwise leave most SMs idle. Instantiated from flash_fwd_hdim<D>_fp16_m<M>[_causal]_sm75.cu.
++template<int Headdim, int kBlockM, int kNWarps, bool Is_causal>
++void run_mha_fwd_tile_impl(Flash_fwd_params &params) {
++    constexpr static int kBlockN = Fwd_tile_n<Headdim>::value;
++    run_flash_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, kNWarps>, Is_causal>(params);
++}
++
++
++template<bool Is_causal>
++void run_mha_fwd_hdim32(Flash_fwd_params &params) {
++    constexpr static int Headdim = 32;
++    constexpr static int kBlockM = 128;
++    constexpr static int kBlockN = 128;
++    constexpr static int kNWarps = 8;
++    run_flash_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, kNWarps>, Is_causal>(params);
++}
++
++
++template<bool Is_causal>
++void run_mha_fwd_hdim128(Flash_fwd_params &params) {
++    constexpr static int Headdim = 128;
++    constexpr static int kBlockM = 128;
++    constexpr static int kBlockN = 64;
++    constexpr static int kNWarps = 8;
++    run_flash_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, kNWarps>, Is_causal>(params);
++
++
++}
++
++
++template<bool Is_causal>
++void run_mha_fwd_hdim96(Flash_fwd_params &params) {
++    constexpr static int Headdim = 96;
++    constexpr static int kBlockM = 128;
++    constexpr static int kBlockN = 64;
++    constexpr static int kNWarps = 8;
++    run_flash_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, kNWarps>, Is_causal>(params);
++
++
++}
++
++
++template<bool Is_causal>
++void run_mha_fwd_hdim64(Flash_fwd_params &params) {
++    constexpr static int Headdim = 64;
++    constexpr static int kBlockM = 128;
++    constexpr static int kBlockN = 128;
++    constexpr static int kNWarps = 8;
++    run_flash_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, kNWarps>, Is_causal>(params);
++
++
++}
+diff -ruN ./csrc/flash_attn/src/flash_fwd_tiles.h /mnt/data/_build_v23_hotfix/flashattn_turing_v23_small_tile_candidate_fixed/source_overlay_v23/csrc/flash_attn/src/flash_fwd_tiles.h
+--- ./csrc/flash_attn/src/flash_fwd_tiles.h	1970-01-01 00:00:00.000000000 +0000
++++ /mnt/data/_build_v23_hotfix/flashattn_turing_v23_small_tile_candidate_fixed/source_overlay_v23/csrc/flash_attn/src/flash_fwd_tiles.h	2026-11-09 13:09:29.579688231 +0000
+@@ -0,0 +1,20 @@
++#pragma once
++// V2.3 forward-tile selection support (see README_V23.md).
++//
++// The V2/V2.2 forward kernels always use kBlockM = 128 (8 warps x 16 rows). With the
++// shapes that matter for short-sequence inference (B*H small, S <= 512) that launches only
++// ceil(S/128) * B * H CTAs, far fewer than the SM count, so most SMs sit idle.
++// V2.3 additionally compiles kBlockM = 64 (4 warps) and kBlockM = 32 (2 warps) variants
++// of the SAME kernel body; the host picks one per launch.
++#include "flash.h"
++
++// kBlockN used by the existing 128-row kernels, kept for the smaller-M variants.
++template <int Headdim>
++struct Fwd_tile_n {
++    static constexpr int value = (Headdim == 96 || Headdim == 128) ? 64 : 128;
++};
++
++// Explicitly specialised in flash_fwd_hdim<D>_fp16_m<M>[_causal]_sm75.cu.
++// kBlockM is the number of query rows per CTA (64 or 32).
++template <int Headdim, bool Is_causal, int kBlockM>
++void run_mha_fwd_tile_(Flash_fwd_params &params);
+diff -ruN ./csrc/flash_attn/src/kernel_traits.h /mnt/data/_build_v23_hotfix/flashattn_turing_v23_small_tile_candidate_fixed/source_overlay_v23/csrc/flash_attn/src/kernel_traits.h
+--- ./csrc/flash_attn/src/kernel_traits.h	2026-11-09 13:12:43.064578498 +0000
++++ /mnt/data/_build_v23_hotfix/flashattn_turing_v23_small_tile_candidate_fixed/source_overlay_v23/csrc/flash_attn/src/kernel_traits.h	2026-11-09 13:09:29.574298033 +0000
+@@ -1,304 +1,310 @@
+-#pragma once
+-
+-#include "cute/tensor.hpp"
+-
+-#include "cutlass/cutlass.h"
+-#include <cutlass/numeric_conversion.h>
+-#include <cutlass/numeric_types.h>
+-using half_t = cutlass::half_t;
+-
+-using namespace cute;
+-
+-// kHeadDim == 32 reuses the narrow 32-column smem/gmem/LDSM configuration that
+-// kHeadDim == 96 already uses (a 96-wide head is three 32-wide atoms; a 32-wide
+-// head is exactly one). The configuration below is selected by
+-// (kHeadDim == 96 || kHeadDim == 32).
+-
+-template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, typename elem_type=cutlass::half_t>
+-struct Flash_kernel_traits {
+-
+-    // Assume __CUDA_ARCH__ == 750
+-
+-    using Element = elem_type;
+-
+-    using ElementAccum = float;
+-    //using index_t = int64_t;
+-
+-    using MMA_Atom_Arch = MMA_Atom<SM75_16x8x8_F32F16F16F32_TN>;
+-
+-    // for hdim = 128, each warp loads 16 rows
+-    using SmemCopyAtomQ = Copy_Atom<SM75_U32x2_LDSM_N, elem_type>;
+-
+-    using SmemCopyAtomK = Copy_Atom<SM75_U32x4_LDSM_N, elem_type>;
+-
+-
+-    using SmemCopyAtomV = Copy_Atom<SM75_U16x8_LDSM_T, elem_type>;
+-
+-    // using SmemCopyAtomV = std::conditional_t<
+-    //     kHeadDim == 64,
+-    //     Copy_Atom<SM75_U16x4_LDSM_T, elem_type>,
+-    //     Copy_Atom<SM75_U16x8_LDSM_T, elem_type>
+-    // >;
+-
+-    using Gmem_copy_struct = AutoVectorizingCopyWithAssumedAlignment<128>;
+-
+-};
+-
+-template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, typename elem_type=cutlass::half_t,
+-         typename Base=Flash_kernel_traits<kHeadDim_, kBlockM_, kBlockN_, kNWarps_, elem_type> >
+-struct Flash_fwd_kernel_traits : public Base {
+-
+-    using Element = typename Base::Element;
+-    using ElementAccum = typename Base::ElementAccum;
+-    //using index_t = typename Base::index_t;
+-    using SmemCopyAtomQ = typename Base::SmemCopyAtomQ;
+-    using SmemCopyAtomK = typename Base::SmemCopyAtomK;
+-    using SmemCopyAtomV = typename Base::SmemCopyAtomV;
+-    using SmemCopyAtomVt = typename Base::SmemCopyAtomV;
+-
+-    static constexpr int kBlockM = kBlockM_;
+-    static constexpr int kBlockN = kBlockN_;
+-    static constexpr int kHeadDim = kHeadDim_;
+-
+-    using TiledMma = TiledMMA<
+-        typename Base::MMA_Atom_Arch,
+-        Layout<Shape<_8,_1,_1>>,
+-        // LDSM loads 32 rows for K and V
+-        Tile<_128, _32, _8>>;
+-
+-    using SmemLayoutAtomQK = std::conditional_t<
+-        (kHeadDim == 96 || kHeadDim == 32),
+-        decltype(composition(Swizzle<2, 3, 3>{}, Layout<Shape<_8, _32>, Stride<_32, _1>>{})),
+-        decltype(composition(Swizzle<3, 3, 3>{}, Layout<Shape<_16, _64>, Stride<_64, _1>>{}))
+-    >;
+-
+-    using SmemLayoutQ = decltype(tile_to_shape(
+-        SmemLayoutAtomQK{},
+-        Shape<Int<kBlockM>, Int<kHeadDim>>{}));
+-
+-
+-    using SmemLayoutK = decltype(tile_to_shape(
+-        SmemLayoutAtomQK{},
+-        Shape<Int<kBlockN>, Int<kHeadDim>>{}));
+-
+-
+-    // using SmemLayoutAtomV = decltype(
+-    //     composition(Swizzle<3, 3, 3>{},
+-    //                 Layout<Shape<_64, _16>,
+-    //                 Stride<_1, _64>>{}));
+-
+-    // using SmemLayoutV = decltype(tile_to_shape(
+-    //     SmemLayoutAtomV{},
+-    //     Shape<Int<kHeadDim>, Int<kBlockN>>{}));
+-
+-    using SmemLayoutAtomV = std::conditional_t<
+-        (kHeadDim == 96 || kHeadDim == 32),
+-        decltype(composition(Swizzle<2, 3, 3>{}, Layout<Shape<_8, _32>, Stride<_32, _1>>{})),
+-        decltype(composition(Swizzle<3, 3, 3>{}, Layout<Shape<_16, _64>, Stride<_64, _1>>{}))
+-    >;
+-
+-    using SmemLayoutV = decltype(tile_to_shape(
+-        SmemLayoutAtomV{},
+-        Shape<Int<kBlockN>, Int<kHeadDim>>{}));
+-
+-    using SmemLayoutVTransposed = decltype(
+-        composition(SmemLayoutV{}, make_layout(Shape<Int<kHeadDim>, Int<kBlockN>>{}, GenRowMajor{})));
+-
+-
+-    using GmemLayoutAtomQK = std::conditional_t<
+-        (kHeadDim == 96 || kHeadDim == 32),
+-        Layout<Shape<_64, _4>, Stride<_4, _1>>,
+-        Layout<Shape<_32, _8>, Stride<_8, _1>>>;
+-
+-    // using GmemLayoutAtomV = Layout<Shape <_8, _32>, Stride<_1, _8>>;
+-    using GmemLayoutAtomV = std::conditional_t<
+-        (kHeadDim == 96 || kHeadDim == 32),
+-        Layout<Shape<_64, _4>, Stride<_4, _1>>,
+-        Layout<Shape<_32, _8>, Stride<_8, _1>>>;
+-
+-
+-    using GmemLayoutAtomO = std::conditional_t<
+-        (kHeadDim == 96 || kHeadDim == 32),
+-        Layout<Shape<_64, _4>, Stride<_4, _1>>,
+-        Layout<Shape<_32, _8>, Stride<_8, _1>>>;
+-
+-
+-    using GmemTiledCopyQK = decltype(
+-            make_tiled_copy(Copy_Atom<typename Base::Gmem_copy_struct, Element>{},
+-                            GmemLayoutAtomQK{},
+-                            Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per read
+-
+-    // using GmemTiledCopyV = decltype(
+-    //         make_tiled_copy(Copy_Atom<typename Base::Gmem_copy_struct, Element>{},
+-    //                         GmemLayoutAtomV{},
+-    //                         Layout<Shape<_8, _1>>{}));  // Val layout, 8 vals per read
+-    using GmemTiledCopyV = decltype(
+-            make_tiled_copy(Copy_Atom<typename Base::Gmem_copy_struct, Element>{},
+-                            GmemLayoutAtomV{},
+-                            Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per read
+-
+-    using GmemTiledCopyO = decltype(
+-            make_tiled_copy(Copy_Atom<typename Base::Gmem_copy_struct, Element>{},
+-                            GmemLayoutAtomO{},
+-                            Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per read
+-
+-
+-};
+-
+-template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, typename elem_type=cutlass::half_t,
+-         typename Base=Flash_kernel_traits<kHeadDim_, kBlockM_, kBlockN_, kNWarps_, elem_type> >
+-struct Flash_bwd_kernel_traits : public Base {
+-
+-    using Element = typename Base::Element;
+-    using ElementAccum = typename Base::ElementAccum;
+-    //using index_t = typename Base::index_t;
+-    using SmemCopyAtomQ = typename Base::SmemCopyAtomQ;
+-    using SmemCopyAtomK = typename Base::SmemCopyAtomK;
+-    using SmemCopyAtomV = typename Base::SmemCopyAtomV;
+-
+-    static constexpr int kBlockM = kBlockM_;
+-    static constexpr int kBlockN = kBlockN_;
+-    static constexpr int kHeadDim = kHeadDim_;
+-    static constexpr int kNWarps = kNWarps_;
+-
+-    //using SmemCopyAtomQ = Copy_Atom<SM75_U32x2_LDSM_N, elem_type>;
+-    using TiledMma_SdP = TiledMMA<
+-        typename Base::MMA_Atom_Arch,
+-        Layout<Shape<_2, Int<kNWarps/2>, _1>>,
+-        Tile<Int<kBlockM>, Int<kBlockN>, _8>>;
+-
+-    using TiledMma_dQ = TiledMMA<
+-        typename Base::MMA_Atom_Arch,
+-        Layout<Shape<_2, Int<kNWarps/2>, _1>>,
+-        std::conditional_t<(kHeadDim == 96 || kHeadDim == 32),
+-            Tile<Int<kBlockM>, Int<32>, _8>,
+-            Tile<Int<kBlockM>, Int<kHeadDim>, _8>
+-        >>;
+-
+-    using TiledMma_dKdV = TiledMMA<
+-        typename Base::MMA_Atom_Arch,
+-        Layout<Shape<_2, Int<kNWarps/2>, _1>>,
+-        std::conditional_t<(kHeadDim == 96 || kHeadDim == 32),
+-            Tile<Int<kBlockN>, Int<32>, _8>,
+-            Tile<Int<kBlockN>, Int<kHeadDim>, _8>
+-        >>;
+-
+-
+-    using SmemLayoutAtomPdS = decltype(
+-        composition(Swizzle<3, 3, 3>{},
+-                    Layout<Shape<Int<16>, Int<kBlockN>>,
+-                           Stride<Int<kBlockN>, _1>>{}));
+-
+-    using SmemLayoutPdS = decltype(tile_to_shape(
+-        SmemLayoutAtomPdS{},
+-        make_shape(Int<kBlockM>{}, Int<kBlockN>{})));
+-
+-    using SmemLayoutPdSTransposed = decltype(
+-        composition(SmemLayoutPdS{}, make_layout(Shape<Int<kBlockN>, Int<kBlockM>>{}, GenRowMajor{})));
+-
+-
+-    // QKV
+-    // swizzle atom
+-    using SmemLayoutAtomQKV = std::conditional_t<
+-        (kHeadDim == 96 || kHeadDim == 32),
+-        decltype(composition(Swizzle<2, 3, 3>{}, Layout<Shape<_8, _32>, Stride<_32, _1>>{})),
+-        decltype(composition(Swizzle<3, 3, 3>{}, Layout<Shape<_16, _64>, Stride<_64, _1>>{}))
+-    >;
+-
+-    // swizzle Q
+-    using SmemLayoutQ = decltype(tile_to_shape(
+-        SmemLayoutAtomQKV{},
+-        Shape<Int<kBlockM>, Int<kHeadDim>>{}));
+-
+-    using SmemLayoutQTransposed = decltype(
+-                      composition(SmemLayoutQ{}, make_layout(Shape<Int<kHeadDim>, Int<kBlockM>>{}, GenRowMajor{})));
+-
+-    // swizzle K
+-    using SmemLayoutAtomKV = std::conditional_t<
+-        (kHeadDim == 96 || kHeadDim == 32),
+-        decltype(composition(Swizzle<2, 3, 3>{}, Layout<Shape<Int<8>, Int<32>>, Stride<Int<32>, _1>>{})),
+-        decltype(composition(Swizzle<3, 3, 3>{}, Layout<Shape<Int<16>, Int<64>>, Stride<Int<64>, _1>>{}))
+-    >;
+-
+-    using SmemLayoutKV = decltype(tile_to_shape(
+-        // SmemLayoutAtomQdO{},
+-        SmemLayoutAtomKV{},
+-        make_shape(Int<kBlockN>{}, Int<kHeadDim>{})));
+-
+-    using SmemLayoutKVTransposed = decltype(
+-        composition(SmemLayoutKV{}, make_layout(Shape<Int<kHeadDim>, Int<kBlockN>>{}, GenRowMajor{})));
+-
+-
+-    // lsdm loads
+-    using SmemCopyAtomQdOPdS = Copy_Atom<SM75_U32x4_LDSM_N, elem_type>;
+-
+-
+-    //using SmemCopyAtomKV = Copy_Atom<SM75_U32x2_LDSM_N, elem_type>;
+-
+-
+-
+-    // kBlockN = 64 -> SM75_U32x2
+-    // kBlockN = 128 -> SM75_U32x4
+-
+-    using SmemCopyAtomKV = std::conditional_t<
+-        kHeadDim == 64,
+-//        Copy_Atom<SM75_U32x4_LDSM_N, elem_type>,
+-        Copy_Atom<SM75_U32x2_LDSM_N, elem_type>,
+-        Copy_Atom<SM75_U32x2_LDSM_N, elem_type>
+-    >;
+-
+-
+-
+-
+-    using SmemCopyAtomKt = std::conditional_t<
+-        kHeadDim == 64,
+-        Copy_Atom<SM75_U16x4_LDSM_T, elem_type>,
+-        std::conditional_t<(kHeadDim == 96 || kHeadDim == 32),
+-            Copy_Atom<SM75_U16x2_LDSM_T, elem_type>,
+-            Copy_Atom<SM75_U16x8_LDSM_T, elem_type>
+-        >
+-    >;
+-
+-    using SmemCopyAtomQt = std::conditional_t<
+-        kHeadDim == 64,
+-        Copy_Atom<SM75_U16x4_LDSM_T, elem_type>,
+-        std::conditional_t<(kHeadDim == 96 || kHeadDim == 32),
+-            Copy_Atom<SM75_U16x2_LDSM_T, elem_type>,
+-            Copy_Atom<SM75_U16x8_LDSM_T, elem_type>
+-        >
+-    >;
+-
+-
+-    using SmemCopyAtomdOt = std::conditional_t<
+-        kHeadDim == 64,
+-        Copy_Atom<SM75_U16x4_LDSM_T, elem_type>,
+-        std::conditional_t<(kHeadDim == 96 || kHeadDim == 32),
+-            Copy_Atom<SM75_U16x2_LDSM_T, elem_type>,
+-            Copy_Atom<SM75_U16x8_LDSM_T, elem_type>
+-        >
+-    >;
+-
+-    // using SmemCopyAtomQtdOtPtdSt = Copy_Atom<SM75_U16x8_LDSM_T, elem_type>;
+-
+-    using SmemCopyAtomPtdSt = std::conditional_t<
+-        (kHeadDim == 96 || kHeadDim == 32),
+-        Copy_Atom<SM75_U16x2_LDSM_T, elem_type>,
+-        Copy_Atom<SM75_U16x8_LDSM_T, elem_type>
+-    >;
+-
+-
+-
+-
+-
+-    //gmem loads
+-    using GmemLayoutAtom = std::conditional_t<
+-        (kHeadDim == 96 || kHeadDim == 32),
+-        Layout<Shape<_64, _4>, Stride<_4, _1>>,
+-        Layout<Shape<_32, _8>, Stride<_8, _1>>>;
+-
+-    using GmemTiledCopy = decltype(
+-            make_tiled_copy(Copy_Atom<typename Base::Gmem_copy_struct, Element>{},
+-                            GmemLayoutAtom{},
+-                            Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per read
+-
++#pragma once
++
++#include "cute/tensor.hpp"
++
++#include "cutlass/cutlass.h"
++#include <cutlass/numeric_conversion.h>
++#include <cutlass/numeric_types.h>
++using half_t = cutlass::half_t;
++
++using namespace cute;
++
++// kHeadDim == 32 reuses the narrow 32-column smem/gmem/LDSM configuration that
++// kHeadDim == 96 already uses (a 96-wide head is three 32-wide atoms; a 32-wide
++// head is exactly one). The configuration below is selected by
++// (kHeadDim == 96 || kHeadDim == 32).
++
++template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, typename elem_type=cutlass::half_t>
++struct Flash_kernel_traits {
++
++    // Assume __CUDA_ARCH__ == 750
++
++    using Element = elem_type;
++
++    using ElementAccum = float;
++    //using index_t = int64_t;
++
++    using MMA_Atom_Arch = MMA_Atom<SM75_16x8x8_F32F16F16F32_TN>;
++
++    // for hdim = 128, each warp loads 16 rows
++    using SmemCopyAtomQ = Copy_Atom<SM75_U32x2_LDSM_N, elem_type>;
++
++    using SmemCopyAtomK = Copy_Atom<SM75_U32x4_LDSM_N, elem_type>;
++
++
++    using SmemCopyAtomV = Copy_Atom<SM75_U16x8_LDSM_T, elem_type>;
++
++    // using SmemCopyAtomV = std::conditional_t<
++    //     kHeadDim == 64,
++    //     Copy_Atom<SM75_U16x4_LDSM_T, elem_type>,
++    //     Copy_Atom<SM75_U16x8_LDSM_T, elem_type>
++    // >;
++
++    using Gmem_copy_struct = AutoVectorizingCopyWithAssumedAlignment<128>;
++
++};
++
++template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, typename elem_type=cutlass::half_t,
++         typename Base=Flash_kernel_traits<kHeadDim_, kBlockM_, kBlockN_, kNWarps_, elem_type> >
++struct Flash_fwd_kernel_traits : public Base {
++
++    using Element = typename Base::Element;
++    using ElementAccum = typename Base::ElementAccum;
++    //using index_t = typename Base::index_t;
++    using SmemCopyAtomQ = typename Base::SmemCopyAtomQ;
++    using SmemCopyAtomK = typename Base::SmemCopyAtomK;
++    using SmemCopyAtomV = typename Base::SmemCopyAtomV;
++    using SmemCopyAtomVt = typename Base::SmemCopyAtomV;
++
++    static constexpr int kBlockM = kBlockM_;
++    static constexpr int kBlockN = kBlockN_;
++    static constexpr int kHeadDim = kHeadDim_;
++    // V2.3: the forward tile is parameterised on the warp count. Every warp owns
++    // exactly 16 query rows, so kBlockM must equal 16 * kNWarps. kNWarps == 8
++    // (kBlockM == 128) produces exactly the same types as V2/V2.2.
++    static constexpr int kNWarps = kNWarps_;
++    static constexpr int kNThreads = kNWarps_ * 32;
++    static_assert(kBlockM_ == 16 * kNWarps_, "forward kernel: each warp must own exactly 16 query rows");
++
++    using TiledMma = TiledMMA<
++        typename Base::MMA_Atom_Arch,
++        Layout<Shape<Int<kNWarps_>,_1,_1>>,
++        // LDSM loads 32 rows for K and V
++        Tile<Int<16 * kNWarps_>, _32, _8>>;
++
++    using SmemLayoutAtomQK = std::conditional_t<
++        (kHeadDim == 96 || kHeadDim == 32),
++        decltype(composition(Swizzle<2, 3, 3>{}, Layout<Shape<_8, _32>, Stride<_32, _1>>{})),
++        decltype(composition(Swizzle<3, 3, 3>{}, Layout<Shape<_16, _64>, Stride<_64, _1>>{}))
++    >;
++
++    using SmemLayoutQ = decltype(tile_to_shape(
++        SmemLayoutAtomQK{},
++        Shape<Int<kBlockM>, Int<kHeadDim>>{}));
++
++
++    using SmemLayoutK = decltype(tile_to_shape(
++        SmemLayoutAtomQK{},
++        Shape<Int<kBlockN>, Int<kHeadDim>>{}));
++
++
++    // using SmemLayoutAtomV = decltype(
++    //     composition(Swizzle<3, 3, 3>{},
++    //                 Layout<Shape<_64, _16>,
++    //                 Stride<_1, _64>>{}));
++
++    // using SmemLayoutV = decltype(tile_to_shape(
++    //     SmemLayoutAtomV{},
++    //     Shape<Int<kHeadDim>, Int<kBlockN>>{}));
++
++    using SmemLayoutAtomV = std::conditional_t<
++        (kHeadDim == 96 || kHeadDim == 32),
++        decltype(composition(Swizzle<2, 3, 3>{}, Layout<Shape<_8, _32>, Stride<_32, _1>>{})),
++        decltype(composition(Swizzle<3, 3, 3>{}, Layout<Shape<_16, _64>, Stride<_64, _1>>{}))
++    >;
++
++    using SmemLayoutV = decltype(tile_to_shape(
++        SmemLayoutAtomV{},
++        Shape<Int<kBlockN>, Int<kHeadDim>>{}));
++
++    using SmemLayoutVTransposed = decltype(
++        composition(SmemLayoutV{}, make_layout(Shape<Int<kHeadDim>, Int<kBlockN>>{}, GenRowMajor{})));
++
++
++    using GmemLayoutAtomQK = std::conditional_t<
++        (kHeadDim == 96 || kHeadDim == 32),
++        Layout<Shape<Int<kNThreads / 4>, _4>, Stride<_4, _1>>,
++        Layout<Shape<Int<kNThreads / 8>, _8>, Stride<_8, _1>>>;
++
++    // using GmemLayoutAtomV = Layout<Shape <_8, _32>, Stride<_1, _8>>;
++    using GmemLayoutAtomV = std::conditional_t<
++        (kHeadDim == 96 || kHeadDim == 32),
++        Layout<Shape<Int<kNThreads / 4>, _4>, Stride<_4, _1>>,
++        Layout<Shape<Int<kNThreads / 8>, _8>, Stride<_8, _1>>>;
++
++
++    using GmemLayoutAtomO = std::conditional_t<
++        (kHeadDim == 96 || kHeadDim == 32),
++        Layout<Shape<Int<kNThreads / 4>, _4>, Stride<_4, _1>>,
++        Layout<Shape<Int<kNThreads / 8>, _8>, Stride<_8, _1>>>;
++
++
++    using GmemTiledCopyQK = decltype(
++            make_tiled_copy(Copy_Atom<typename Base::Gmem_copy_struct, Element>{},
++                            GmemLayoutAtomQK{},
++                            Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per read
++
++    // using GmemTiledCopyV = decltype(
++    //         make_tiled_copy(Copy_Atom<typename Base::Gmem_copy_struct, Element>{},
++    //                         GmemLayoutAtomV{},
++    //                         Layout<Shape<_8, _1>>{}));  // Val layout, 8 vals per read
++    using GmemTiledCopyV = decltype(
++            make_tiled_copy(Copy_Atom<typename Base::Gmem_copy_struct, Element>{},
++                            GmemLayoutAtomV{},
++                            Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per read
++
++    using GmemTiledCopyO = decltype(
++            make_tiled_copy(Copy_Atom<typename Base::Gmem_copy_struct, Element>{},
++                            GmemLayoutAtomO{},
++                            Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per read
++
++
++};
++
++template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, typename elem_type=cutlass::half_t,
++         typename Base=Flash_kernel_traits<kHeadDim_, kBlockM_, kBlockN_, kNWarps_, elem_type> >
++struct Flash_bwd_kernel_traits : public Base {
++
++    using Element = typename Base::Element;
++    using ElementAccum = typename Base::ElementAccum;
++    //using index_t = typename Base::index_t;
++    using SmemCopyAtomQ = typename Base::SmemCopyAtomQ;
++    using SmemCopyAtomK = typename Base::SmemCopyAtomK;
++    using SmemCopyAtomV = typename Base::SmemCopyAtomV;
++
++    static constexpr int kBlockM = kBlockM_;
++    static constexpr int kBlockN = kBlockN_;
++    static constexpr int kHeadDim = kHeadDim_;
++    static constexpr int kNWarps = kNWarps_;
++
++    //using SmemCopyAtomQ = Copy_Atom<SM75_U32x2_LDSM_N, elem_type>;
++    using TiledMma_SdP = TiledMMA<
++        typename Base::MMA_Atom_Arch,
++        Layout<Shape<_2, Int<kNWarps/2>, _1>>,
++        Tile<Int<kBlockM>, Int<kBlockN>, _8>>;
++
++    using TiledMma_dQ = TiledMMA<
++        typename Base::MMA_Atom_Arch,
++        Layout<Shape<_2, Int<kNWarps/2>, _1>>,
++        std::conditional_t<(kHeadDim == 96 || kHeadDim == 32),
++            Tile<Int<kBlockM>, Int<32>, _8>,
++            Tile<Int<kBlockM>, Int<kHeadDim>, _8>
++        >>;
++
++    using TiledMma_dKdV = TiledMMA<
++        typename Base::MMA_Atom_Arch,
++        Layout<Shape<_2, Int<kNWarps/2>, _1>>,
++        std::conditional_t<(kHeadDim == 96 || kHeadDim == 32),
++            Tile<Int<kBlockN>, Int<32>, _8>,
++            Tile<Int<kBlockN>, Int<kHeadDim>, _8>
++        >>;
++
++
++    using SmemLayoutAtomPdS = decltype(
++        composition(Swizzle<3, 3, 3>{},
++                    Layout<Shape<Int<16>, Int<kBlockN>>,
++                           Stride<Int<kBlockN>, _1>>{}));
++
++    using SmemLayoutPdS = decltype(tile_to_shape(
++        SmemLayoutAtomPdS{},
++        make_shape(Int<kBlockM>{}, Int<kBlockN>{})));
++
++    using SmemLayoutPdSTransposed = decltype(
++        composition(SmemLayoutPdS{}, make_layout(Shape<Int<kBlockN>, Int<kBlockM>>{}, GenRowMajor{})));
++
++
++    // QKV
++    // swizzle atom
++    using SmemLayoutAtomQKV = std::conditional_t<
++        (kHeadDim == 96 || kHeadDim == 32),
++        decltype(composition(Swizzle<2, 3, 3>{}, Layout<Shape<_8, _32>, Stride<_32, _1>>{})),
++        decltype(composition(Swizzle<3, 3, 3>{}, Layout<Shape<_16, _64>, Stride<_64, _1>>{}))
++    >;
++
++    // swizzle Q
++    using SmemLayoutQ = decltype(tile_to_shape(
++        SmemLayoutAtomQKV{},
++        Shape<Int<kBlockM>, Int<kHeadDim>>{}));
++
++    using SmemLayoutQTransposed = decltype(
++                      composition(SmemLayoutQ{}, make_layout(Shape<Int<kHeadDim>, Int<kBlockM>>{}, GenRowMajor{})));
++
++    // swizzle K
++    using SmemLayoutAtomKV = std::conditional_t<
++        (kHeadDim == 96 || kHeadDim == 32),
++        decltype(composition(Swizzle<2, 3, 3>{}, Layout<Shape<Int<8>, Int<32>>, Stride<Int<32>, _1>>{})),
++        decltype(composition(Swizzle<3, 3, 3>{}, Layout<Shape<Int<16>, Int<64>>, Stride<Int<64>, _1>>{}))
++    >;
++
++    using SmemLayoutKV = decltype(tile_to_shape(
++        // SmemLayoutAtomQdO{},
++        SmemLayoutAtomKV{},
++        make_shape(Int<kBlockN>{}, Int<kHeadDim>{})));
++
++    using SmemLayoutKVTransposed = decltype(
++        composition(SmemLayoutKV{}, make_layout(Shape<Int<kHeadDim>, Int<kBlockN>>{}, GenRowMajor{})));
++
++
++    // lsdm loads
++    using SmemCopyAtomQdOPdS = Copy_Atom<SM75_U32x4_LDSM_N, elem_type>;
++
++
++    //using SmemCopyAtomKV = Copy_Atom<SM75_U32x2_LDSM_N, elem_type>;
++
++
++
++    // kBlockN = 64 -> SM75_U32x2
++    // kBlockN = 128 -> SM75_U32x4
++
++    using SmemCopyAtomKV = std::conditional_t<
++        kHeadDim == 64,
++//        Copy_Atom<SM75_U32x4_LDSM_N, elem_type>,
++        Copy_Atom<SM75_U32x2_LDSM_N, elem_type>,
++        Copy_Atom<SM75_U32x2_LDSM_N, elem_type>
++    >;
++
++
++
++
++    using SmemCopyAtomKt = std::conditional_t<
++        kHeadDim == 64,
++        Copy_Atom<SM75_U16x4_LDSM_T, elem_type>,
++        std::conditional_t<(kHeadDim == 96 || kHeadDim == 32),
++            Copy_Atom<SM75_U16x2_LDSM_T, elem_type>,
++            Copy_Atom<SM75_U16x8_LDSM_T, elem_type>
++        >
++    >;
++
++    using SmemCopyAtomQt = std::conditional_t<
++        kHeadDim == 64,
++        Copy_Atom<SM75_U16x4_LDSM_T, elem_type>,
++        std::conditional_t<(kHeadDim == 96 || kHeadDim == 32),
++            Copy_Atom<SM75_U16x2_LDSM_T, elem_type>,
++            Copy_Atom<SM75_U16x8_LDSM_T, elem_type>
++        >
++    >;
++
++
++    using SmemCopyAtomdOt = std::conditional_t<
++        kHeadDim == 64,
++        Copy_Atom<SM75_U16x4_LDSM_T, elem_type>,
++        std::conditional_t<(kHeadDim == 96 || kHeadDim == 32),
++            Copy_Atom<SM75_U16x2_LDSM_T, elem_type>,
++            Copy_Atom<SM75_U16x8_LDSM_T, elem_type>
++        >
++    >;
++
++    // using SmemCopyAtomQtdOtPtdSt = Copy_Atom<SM75_U16x8_LDSM_T, elem_type>;
++
++    using SmemCopyAtomPtdSt = std::conditional_t<
++        (kHeadDim == 96 || kHeadDim == 32),
++        Copy_Atom<SM75_U16x2_LDSM_T, elem_type>,
++        Copy_Atom<SM75_U16x8_LDSM_T, elem_type>
++    >;
++
++
++
++
++
++    //gmem loads
++    using GmemLayoutAtom = std::conditional_t<
++        (kHeadDim == 96 || kHeadDim == 32),
++        Layout<Shape<_64, _4>, Stride<_4, _1>>,
++        Layout<Shape<_32, _8>, Stride<_8, _1>>>;
++
++    using GmemTiledCopy = decltype(
++            make_tiled_copy(Copy_Atom<typename Base::Gmem_copy_struct, Element>{},
++                            GmemLayoutAtom{},
++                            Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per read
++
+ };
+\ No newline at end of file
+diff -ruN ./setup.py /mnt/data/_build_v23_hotfix/flashattn_turing_v23_small_tile_candidate_fixed/source_overlay_v23/setup.py
+--- ./setup.py	2026-11-09 13:12:43.062430811 +0000
++++ /mnt/data/_build_v23_hotfix/flashattn_turing_v23_small_tile_candidate_fixed/source_overlay_v23/setup.py	2026-11-09 13:09:29.571807654 +0000
+@@ -1,80 +1,100 @@
+-from setuptools import setup
+-from torch.utils.cpp_extension import CUDAExtension, BuildExtension
+-import os
+-import sys
+-from pathlib import Path
+-import subprocess
+-
+-this_dir = os.path.dirname(os.path.abspath(__file__))
+-
+-
+-if os.path.isdir(".git"):
+-    subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"], check=True)
+-
+-nvcc_flags = ["-std=c++17",
+-              "--expt-relaxed-constexpr",
+-              "-arch=sm_75",
+-              "-O3",
+-              "--use_fast_math",
+-              "--ptxas-options=-v",
+-              "-lineinfo"]
+-
+-if sys.platform == "win32":
+-    from distutils import ccompiler
+-    compiler = ccompiler.new_compiler()
+-    if compiler.compiler_type == "msvc":
+-        nvcc_flags[0] = "-std=c++17"
+-        nvcc_flags.extend(["-Xcompiler", "/Zc:preprocessor"])
+-# Opt-in native D32 kernels (default: V1 zero-pad-to-D64 path).
+-#   set FLASH_TURING_NATIVE_D32=1   (cmd: set FLASH_TURING_NATIVE_D32=1)
+-native_d32 = os.environ.get("FLASH_TURING_NATIVE_D32", "0") == "1"
+-
+-# V2 forward-kernel variants (all opt-in, default = V1 kernel math/schedule). See README_V2.md.
+-#   set FLASH_TURING_SEPV=1     separate V smem buffer + V staged in registers
+-#   set FLASH_TURING_FASTSM=1   exp2-domain softmax, no separate S*=scale pass (needs softmax_scale > 0)
+-v2_macros = []
+-if os.environ.get("FLASH_TURING_SEPV", "0") == "1":
+-    v2_macros.append(("FLASH_TURING_SEPV", "1"))
+-if os.environ.get("FLASH_TURING_FASTSM", "0") == "1":
+-    v2_macros.append(("FLASH_TURING_FASTSM", "1"))
+-native_d32_sources = [
+-    "csrc/flash_attn/src/flash_fwd_hdim32_fp16_sm75.cu",
+-    "csrc/flash_attn/src/flash_fwd_hdim32_fp16_causal_sm75.cu",
+-    "csrc/flash_attn/src/flash_bwd_hdim32_fp16_sm75.cu",
+-    "csrc/flash_attn/src/flash_bwd_hdim32_fp16_causal_sm75.cu",
+-] if native_d32 else []
+-
+-setup(
+-    name="flash_attn_turing",
+-    ext_modules=[
+-        CUDAExtension(
+-            name="flash_attn_turing",
+-            sources=["csrc/flash_attn/flash_api.cpp",
+-                     "csrc/flash_attn/src/d32_pad_sm75.cu",
+-                     "csrc/flash_attn/src/flash_fwd_hdim64_fp16_sm75.cu",
+-                     "csrc/flash_attn/src/flash_fwd_hdim64_fp16_causal_sm75.cu",
+-                     "csrc/flash_attn/src/flash_fwd_hdim96_fp16_sm75.cu",
+-                     "csrc/flash_attn/src/flash_fwd_hdim96_fp16_causal_sm75.cu",
+-                     "csrc/flash_attn/src/flash_fwd_hdim128_fp16_sm75.cu",
+-                     "csrc/flash_attn/src/flash_fwd_hdim128_fp16_causal_sm75.cu",
+-                     "csrc/flash_attn/src/flash_bwd_hdim64_fp16_sm75.cu",
+-                     "csrc/flash_attn/src/flash_bwd_hdim64_fp16_causal_sm75.cu",
+-                     "csrc/flash_attn/src/flash_bwd_hdim96_fp16_sm75.cu",
+-                     "csrc/flash_attn/src/flash_bwd_hdim96_fp16_causal_sm75.cu",
+-                     "csrc/flash_attn/src/flash_bwd_hdim128_fp16_sm75.cu",
+-                     "csrc/flash_attn/src/flash_bwd_hdim128_fp16_causal_sm75.cu"
+-                     ] + native_d32_sources,
+-            define_macros=([("FLASH_TURING_NATIVE_D32", "1")] if native_d32 else []) + v2_macros,
+-            include_dirs=[
+-                Path(this_dir) / "csrc" / "flash_attn",
+-                Path(this_dir) / "csrc" / "flash_attn" / "src",
+-                Path(this_dir) / "csrc" / "cutlass" / "include",
+-                Path(this_dir) / "csrc" / "cutlass" / "tools/util/include"
+-                ],
+-            extra_compile_args={'nvcc': nvcc_flags}
+-        )
+-    ],
+-    install_requires=["torch"],
+-    cmdclass={"build_ext": BuildExtension}
+-)
+-
++from setuptools import setup
++from torch.utils.cpp_extension import CUDAExtension, BuildExtension
++import os
++import sys
++from pathlib import Path
++import subprocess
++
++this_dir = os.path.dirname(os.path.abspath(__file__))
++
++
++if os.path.isdir(".git"):
++    subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"], check=True)
++
++nvcc_flags = ["-std=c++17",
++              "--expt-relaxed-constexpr",
++              "-arch=sm_75",
++              "-O3",
++              "--use_fast_math",
++              "--ptxas-options=-v",
++              "-lineinfo"]
++
++if sys.platform == "win32":
++    from distutils import ccompiler
++    compiler = ccompiler.new_compiler()
++    if compiler.compiler_type == "msvc":
++        nvcc_flags[0] = "-std=c++17"
++        nvcc_flags.extend(["-Xcompiler", "/Zc:preprocessor"])
++# Opt-in native D32 kernels (default: V1 zero-pad-to-D64 path).
++#   set FLASH_TURING_NATIVE_D32=1   (cmd: set FLASH_TURING_NATIVE_D32=1)
++native_d32 = os.environ.get("FLASH_TURING_NATIVE_D32", "0") == "1"
++
++# V2 forward-kernel variants (all opt-in, default = V1 kernel math/schedule). See README_V2.md.
++#   set FLASH_TURING_SEPV=1     separate V smem buffer + V staged in registers
++#   set FLASH_TURING_FASTSM=1   exp2-domain softmax, no separate S*=scale pass (needs softmax_scale > 0)
++v2_macros = []
++if os.environ.get("FLASH_TURING_SEPV", "0") == "1":
++    v2_macros.append(("FLASH_TURING_SEPV", "1"))
++if os.environ.get("FLASH_TURING_FASTSM", "0") == "1":
++    v2_macros.append(("FLASH_TURING_FASTSM", "1"))
++# V2.3 forward tile variants (opt-in; default = V2/V2.2 kernels only)
++#   set FLASH_TURING_SMALLM=1   also compile kBlockM=64 (4 warps) forward kernels
++#   set FLASH_TURING_SMALLM=2   also compile kBlockM=32 (2 warps) forward kernels
++#   set FLASH_TURING_CAUSAL_REVERSE=0   disable heavy-first causal CTA order (default on when SMALLM is set)
++smallm = os.environ.get("FLASH_TURING_SMALLM", "0")
++if smallm not in ("0", "1", "2"):
++    raise SystemExit("FLASH_TURING_SMALLM must be 0, 1 or 2")
++if smallm != "0":
++    v2_macros.append(("FLASH_TURING_SMALLM", smallm))
++    if os.environ.get("FLASH_TURING_CAUSAL_REVERSE", "1") == "1":
++        v2_macros.append(("FLASH_TURING_CAUSAL_REVERSE", "1"))
++smallm_sources = []
++for _m in ([64] if smallm == "1" else [64, 32] if smallm == "2" else []):
++    for _d in (32, 64, 96, 128):
++        # D32 tiles need the native-D32 build; the padded fallback launches the D64 tiles.
++        if _d == 32 and not native_d32:
++            continue
++        for _c in ("", "_causal"):
++            smallm_sources.append(f"csrc/flash_attn/src/flash_fwd_hdim{_d}_fp16_m{_m}{_c}_sm75.cu")
++
++native_d32_sources = [
++    "csrc/flash_attn/src/flash_fwd_hdim32_fp16_sm75.cu",
++    "csrc/flash_attn/src/flash_fwd_hdim32_fp16_causal_sm75.cu",
++    "csrc/flash_attn/src/flash_bwd_hdim32_fp16_sm75.cu",
++    "csrc/flash_attn/src/flash_bwd_hdim32_fp16_causal_sm75.cu",
++] if native_d32 else []
++
++setup(
++    name="flash_attn_turing",
++    ext_modules=[
++        CUDAExtension(
++            name="flash_attn_turing",
++            sources=["csrc/flash_attn/flash_api.cpp",
++                     "csrc/flash_attn/src/d32_pad_sm75.cu",
++                     "csrc/flash_attn/src/flash_fwd_hdim64_fp16_sm75.cu",
++                     "csrc/flash_attn/src/flash_fwd_hdim64_fp16_causal_sm75.cu",
++                     "csrc/flash_attn/src/flash_fwd_hdim96_fp16_sm75.cu",
++                     "csrc/flash_attn/src/flash_fwd_hdim96_fp16_causal_sm75.cu",
++                     "csrc/flash_attn/src/flash_fwd_hdim128_fp16_sm75.cu",
++                     "csrc/flash_attn/src/flash_fwd_hdim128_fp16_causal_sm75.cu",
++                     "csrc/flash_attn/src/flash_bwd_hdim64_fp16_sm75.cu",
++                     "csrc/flash_attn/src/flash_bwd_hdim64_fp16_causal_sm75.cu",
++                     "csrc/flash_attn/src/flash_bwd_hdim96_fp16_sm75.cu",
++                     "csrc/flash_attn/src/flash_bwd_hdim96_fp16_causal_sm75.cu",
++                     "csrc/flash_attn/src/flash_bwd_hdim128_fp16_sm75.cu",
++                     "csrc/flash_attn/src/flash_bwd_hdim128_fp16_causal_sm75.cu"
++                     ] + native_d32_sources + smallm_sources,
++            define_macros=([("FLASH_TURING_NATIVE_D32", "1")] if native_d32 else []) + v2_macros,
++            include_dirs=[
++                Path(this_dir) / "csrc" / "flash_attn",
++                Path(this_dir) / "csrc" / "flash_attn" / "src",
++                Path(this_dir) / "csrc" / "cutlass" / "include",
++                Path(this_dir) / "csrc" / "cutlass" / "tools/util/include"
++                ],
++            extra_compile_args={'nvcc': nvcc_flags}
++        )
++    ],
++    install_requires=["torch"],
++    cmdclass={"build_ext": BuildExtension}
++)
++

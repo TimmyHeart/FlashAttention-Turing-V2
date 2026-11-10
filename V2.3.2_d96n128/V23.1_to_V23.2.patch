@@ -1,0 +1,282 @@
+--- a/csrc/flash_attn/flash_api.cpp
++++ b/csrc/flash_attn/flash_api.cpp
+@@ -238,19 +238,25 @@
+ 
+ 
+ // ---------------------------------------------------------------------------------------------
+-// V2.3 forward tile selection.
+-// FLASH_TURING_SMALLM=1 compiles the kBlockM=64 (4 warp) kernels, =2 also kBlockM=32 (2 warp).
+-// With neither defined, run_mha_fwd launches exactly the V2/V2.2 kBlockM=128 kernels.
+-// Mode 0 = automatic (cost model below); 128/64/32 force one tile (for A/B and the tuner).
++// V2.3.2 forward tile selection.
++// SMALLM=1 compiles M64 (4 warps), SMALLM=2 also compiles M32 (2 warps).
++// D96_M64_N128 adds a separate D96 / M64 / N128 experiment (tile id 65).
++// Automatic shape profiles are deliberately gated to the exact fixed-length CMP 40HX
++// benchmark profiles (34 SMs, B1H4 and B2H8). Unmeasured shapes use the generic wave model.
++// Mode 0 = automatic; 128/64/32 force M; 65 forces D96 M64 N128 only.
+ // ---------------------------------------------------------------------------------------------
+ #ifdef FLASH_TURING_SMALLM
+ static constexpr int kFwdTileCompiled = FLASH_TURING_SMALLM;
+ #else
+ static constexpr int kFwdTileCompiled = 0;
+ #endif
++#ifdef FLASH_TURING_D96_M64_N128
++static constexpr int kFwdTileD96M64N128Compiled = 1;
++#else
++static constexpr int kFwdTileD96M64N128Compiled = 0;
++#endif
+ static std::atomic<int> g_fwd_tile_mode{0};
+-// Per-row-block fixed cost (in units of query rows) used by the automatic model: the K/V loop
+-// has latency that does not shrink with kBlockM, so a smaller tile is not proportionally faster.
++// Kept for unprofiled shapes only. The CMP 40HX profiles below are empirical choices.
+ static std::atomic<int> g_fwd_tile_fixed_cost{48};
+ 
+ static inline int device_sm_count() {
+@@ -268,11 +274,10 @@
+     return sms;
+ }
+ 
+-static inline int plan_fwd_tile(const int b, const int seqlen_q, const int h) {
++static inline int plan_fwd_tile_wave_model(const int b, const int seqlen_q,
++                                            const int h, const int sms) {
+     if (kFwdTileCompiled <= 0) return 128;
+-    const int mode = g_fwd_tile_mode.load(std::memory_order_relaxed);
+-    if (mode != 0) return mode;
+-    const long long sms = device_sm_count();
++    const long long safe_sms = sms > 0 ? sms : 1;
+     const long long bh = static_cast<long long>(b) * static_cast<long long>(h);
+     const long long fixed = g_fwd_tile_fixed_cost.load(std::memory_order_relaxed);
+     int best = 128;
+@@ -282,20 +287,90 @@
+         if (t == 64 && kFwdTileCompiled < 1) continue;
+         if (t == 32 && kFwdTileCompiled < 2) continue;
+         const long long ctas = ((static_cast<long long>(seqlen_q) + t - 1) / t) * bh;
+-        const long long waves = (ctas + sms - 1) / sms;
++        const long long waves = (ctas + safe_sms - 1) / safe_sms;
+         const long long cost = waves * (t + fixed);
+         if (cost < best_cost) { best_cost = cost; best = t; }
+     }
+     return best;
+ }
+ 
++// Empirical policy from the full M128/M64/M32 sweep on CMP 40HX (34 SMs).
++// Returns -1 outside the exact shapes that were measured. Causal and non-causal
++// are separate because D96/D128 and D32 show material causal-dependent winners.
++static inline int plan_fwd_tile_cmp40hx_profile(const int b, const int h,
++                                                 const int d, const int s,
++                                                 const bool causal) {
++    if (b == 1 && h == 4 && (s == 128 || s == 256 || s == 512)) {
++        switch (d) {
++            case 32: return s <= 256 ? 32 : 64;
++            case 64: return 64;
++            case 96: return (!causal && s <= 256) ? 32 : 64;
++            case 128: return (!causal && s == 128) ? 32 : 64;
++            default: return -1;
++        }
++    }
++    if (b == 2 && h == 8 && (s == 128 || s == 256 || s == 512 || s == 1024)) {
++        if (s == 128) return 64;
++        switch (d) {
++            case 32: return (s == 256 && !causal) ? 128 : 64;
++            case 64:
++            case 96: return 128;
++            case 128: return (causal && s >= 512) ? 64 : 128;
++            default: return -1;
++        }
++    }
++    return -1;
++}
++
++static inline int plan_fwd_tile_for_params(const Flash_fwd_params &params) {
++    const int mode = g_fwd_tile_mode.load(std::memory_order_relaxed);
++    if (mode != 0) return mode;
++    if (kFwdTileCompiled <= 0) return 128;
++
++    const int sms = device_sm_count();
++    const bool fixed_full_sequence = params.cu_seqlens_q == nullptr &&
++                                     params.cu_seqlens_k == nullptr &&
++                                     params.seqlen_q == params.seqlen_k;
++    if (sms == 34 && fixed_full_sequence) {
++        const int profiled = plan_fwd_tile_cmp40hx_profile(
++            params.b, params.h, params.d, params.seqlen_q, params.is_causal);
++        if (profiled > 0) {
++            if (profiled == 32 && kFwdTileCompiled < 2) return 64;
++            if (profiled == 64 && kFwdTileCompiled < 1) return 128;
++            return profiled;
++        }
++    }
++    return plan_fwd_tile_wave_model(params.b, params.seqlen_q, params.h, sms);
++}
++
++static inline int plan_fwd_tile_shape(const int b, const int seqlen_q,
++                                       const int h, const int d, const bool causal) {
++    Flash_fwd_params params{};
++    params.b = b;
++    params.seqlen_q = seqlen_q;
++    params.seqlen_k = seqlen_q;
++    params.h = h;
++    params.d = d;
++    params.is_causal = causal;
++    return plan_fwd_tile_for_params(params);
++}
++
++// Compatibility API retained for callers that only know B/S/H. It uses the generic model.
++static inline int plan_fwd_tile(const int b, const int seqlen_q, const int h) {
++    const int mode = g_fwd_tile_mode.load(std::memory_order_relaxed);
++    if (mode != 0) return mode;
++    return plan_fwd_tile_wave_model(b, seqlen_q, h, device_sm_count());
++}
++
+ static void set_fwd_tile_mode(const int mode) {
+-    TORCH_CHECK(mode == 0 || mode == 128 || mode == 64 || mode == 32,
+-                "fwd tile mode must be 0 (auto), 128, 64 or 32");
++    TORCH_CHECK(mode == 0 || mode == 128 || mode == 64 || mode == 32 || mode == 65,
++                "fwd tile mode must be 0 (auto), 128, 64, 32, or 65 (D96 M64 N128)");
+     TORCH_CHECK(mode != 64 || kFwdTileCompiled >= 1,
+                 "kBlockM=64 kernels were not compiled (build with FLASH_TURING_SMALLM=1 or 2)");
+     TORCH_CHECK(mode != 32 || kFwdTileCompiled >= 2,
+                 "kBlockM=32 kernels were not compiled (build with FLASH_TURING_SMALLM=2)");
++    TORCH_CHECK(mode != 65 || (kFwdTileCompiled >= 1 && kFwdTileD96M64N128Compiled),
++                "D96 M64 N128 kernel was not compiled (set FLASH_TURING_D96_M64_N128=1)");
+     g_fwd_tile_mode.store(mode, std::memory_order_relaxed);
+ }
+ 
+@@ -305,11 +380,20 @@
+ }
+ 
+ // Keep preprocessor conditionals outside HEADDIM_SWITCH / BOOL_SWITCH macro arguments.
+-// MSVC does not treat #if directives embedded in a macro argument as directives;
+-// it parses the tokens as part of the lambda body and reports C2065/C2121.
+ template <int Headdim, bool Is_causal>
+ static inline void dispatch_mha_fwd_tile(Flash_fwd_params &params, const int tile) {
+-    (void)tile;  // Also keeps the V2.2-only build warning-clean when SMALLM is not defined.
++#if defined(FLASH_TURING_D96_M64_N128)
++    if (tile == 65) {
++        if constexpr (Headdim == 96) {
++            run_mha_fwd_tile_<96, Is_causal, 64, 128>(params);
++            return;
++        } else {
++            TORCH_CHECK(false, "tile mode 65 is only valid for head dimension 96");
++            return;
++        }
++    }
++#endif
++    (void)tile;
+ #ifdef FLASH_TURING_SMALLM
+     if (tile == 64) {
+         run_mha_fwd_tile_<Headdim, Is_causal, 64>(params);
+@@ -326,7 +410,7 @@
+ }
+ 
+ void run_mha_fwd(Flash_fwd_params &params){
+-    const int tile = plan_fwd_tile(params.b, params.seqlen_q, params.h);
++    const int tile = plan_fwd_tile_for_params(params);
+     HEADDIM_SWITCH(params.d, [&] {
+         BOOL_SWITCH(params.is_causal, Is_causal, [&] {
+             dispatch_mha_fwd_tile<kHeadDim, Is_causal>(params, tile);
+@@ -884,13 +968,20 @@
+     m.def("varlen_bwd", &mha_varlen_bwd, "Varlen backward pass");
+     // V2.3 forward tile control (no effect unless built with FLASH_TURING_SMALLM >= 1)
+     m.def("set_fwd_tile_mode", &set_fwd_tile_mode, pybind11::arg("mode"),
+-          "0 = auto, 128/64/32 = force that kBlockM for subsequent forward launches");
++          "0 = auto, 128/64/32 = force kBlockM; 65 = force D96 M64 N128");
+     m.def("get_fwd_tile_mode", []() { return g_fwd_tile_mode.load(std::memory_order_relaxed); });
+     m.def("set_fwd_tile_fixed_cost", &set_fwd_tile_fixed_cost, pybind11::arg("cost"),
+           "Fixed per-row-block cost (in rows) used by the automatic tile model; default 48");
+     m.def("fwd_tile_support", []() { return kFwdTileCompiled; },
+           "0: only kBlockM=128; 1: also 64; 2: also 32");
++    m.def("fwd_tile_n128_support", []() { return kFwdTileD96M64N128Compiled; },
++          "1 when the experimental D96/M64/N128 variants are compiled");
+     m.def("plan_fwd_tile", [](int batch, int seqlen_q, int heads) { return plan_fwd_tile(batch, seqlen_q, heads); },
+           pybind11::arg("batch"), pybind11::arg("seqlen_q"), pybind11::arg("heads"),
+-          "kBlockM the forward launch would use for this shape under the current mode");
+-}
++          "Legacy B/S/H generic wave-model estimate");
++    m.def("plan_fwd_tile_for_shape", [](int batch, int seqlen_q, int heads, int head_dim, bool causal) {
++              return plan_fwd_tile_shape(batch, seqlen_q, heads, head_dim, causal);
++          }, pybind11::arg("batch"), pybind11::arg("seqlen_q"), pybind11::arg("heads"),
++             pybind11::arg("head_dim"), pybind11::arg("causal"),
++          "Shape-aware auto dispatch estimate; exact CMP40HX profiles or generic fallback");
++}
+--- /dev/null
++++ b/csrc/flash_attn/src/flash_fwd_hdim96_fp16_m64_n128_causal_sm75.cu
+@@ -0,0 +1,10 @@
++#include "flash_fwd_launch_template.h"
++
++#include <cutlass/numeric_types.h>
++
++using half_t = cutlass::half_t;
++
++template<>
++void run_mha_fwd_tile_<96, true, 64, 128>(Flash_fwd_params &params) {
++    run_mha_fwd_tile_impl_n<96, 64, 128, 4, true>(params);
++}
+--- /dev/null
++++ b/csrc/flash_attn/src/flash_fwd_hdim96_fp16_m64_n128_sm75.cu
+@@ -0,0 +1,10 @@
++#include "flash_fwd_launch_template.h"
++
++#include <cutlass/numeric_types.h>
++
++using half_t = cutlass::half_t;
++
++template<>
++void run_mha_fwd_tile_<96, false, 64, 128>(Flash_fwd_params &params) {
++    run_mha_fwd_tile_impl_n<96, 64, 128, 4, false>(params);
++}
+--- a/csrc/flash_attn/src/flash_fwd_launch_template.h
++++ b/csrc/flash_attn/src/flash_fwd_launch_template.h
+@@ -116,10 +116,15 @@
+ 
+ // V2.3: smaller-M variants (kBlockM = 16 * kNWarps) of the same kernel, for grids that would
+ // otherwise leave most SMs idle. Instantiated from flash_fwd_hdim<D>_fp16_m<M>[_causal]_sm75.cu.
++template<int Headdim, int kBlockM, int kBlockN, int kNWarps, bool Is_causal>
++void run_mha_fwd_tile_impl_n(Flash_fwd_params &params) {
++    run_flash_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, kNWarps>, Is_causal>(params);
++}
++
+ template<int Headdim, int kBlockM, int kNWarps, bool Is_causal>
+ void run_mha_fwd_tile_impl(Flash_fwd_params &params) {
+     constexpr static int kBlockN = Fwd_tile_n<Headdim>::value;
+-    run_flash_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, kNWarps>, Is_causal>(params);
++    run_mha_fwd_tile_impl_n<Headdim, kBlockM, kBlockN, kNWarps, Is_causal>(params);
+ }
+ 
+ 
+--- a/csrc/flash_attn/src/flash_fwd_tiles.h
++++ b/csrc/flash_attn/src/flash_fwd_tiles.h
+@@ -16,5 +16,6 @@
+ 
+ // Explicitly specialised in flash_fwd_hdim<D>_fp16_m<M>[_causal]_sm75.cu.
+ // kBlockM is the number of query rows per CTA (64 or 32).
+-template <int Headdim, bool Is_causal, int kBlockM>
++template <int Headdim, bool Is_causal, int kBlockM,
++          int kBlockN = Fwd_tile_n<Headdim>::value>
+ void run_mha_fwd_tile_(Flash_fwd_params &params);
+--- a/setup.py
++++ b/setup.py
+@@ -48,6 +48,11 @@
+     v2_macros.append(("FLASH_TURING_SMALLM", smallm))
+     if os.environ.get("FLASH_TURING_CAUSAL_REVERSE", "1") == "1":
+         v2_macros.append(("FLASH_TURING_CAUSAL_REVERSE", "1"))
++d96_m64_n128 = os.environ.get("FLASH_TURING_D96_M64_N128", "0") == "1"
++if d96_m64_n128 and smallm == "0":
++    raise SystemExit("FLASH_TURING_D96_M64_N128=1 requires FLASH_TURING_SMALLM=1 or 2")
++if d96_m64_n128:
++    v2_macros.append(("FLASH_TURING_D96_M64_N128", "1"))
+ smallm_sources = []
+ for _m in ([64] if smallm == "1" else [64, 32] if smallm == "2" else []):
+     for _d in (32, 64, 96, 128):
+@@ -56,6 +61,12 @@
+             continue
+         for _c in ("", "_causal"):
+             smallm_sources.append(f"csrc/flash_attn/src/flash_fwd_hdim{_d}_fp16_m{_m}{_c}_sm75.cu")
++
++if d96_m64_n128:
++    smallm_sources.extend([
++        "csrc/flash_attn/src/flash_fwd_hdim96_fp16_m64_n128_sm75.cu",
++        "csrc/flash_attn/src/flash_fwd_hdim96_fp16_m64_n128_causal_sm75.cu",
++    ])
+ 
+ native_d32_sources = [
+     "csrc/flash_attn/src/flash_fwd_hdim32_fp16_sm75.cu",

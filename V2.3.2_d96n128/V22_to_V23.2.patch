@@ -1,0 +1,644 @@
+--- a/csrc/flash_attn/flash_api.cpp
++++ b/csrc/flash_attn/flash_api.cpp
+@@ -1,9 +1,12 @@
+ #include <torch/extension.h>
+ #include <cmath>
++#include <atomic>
++#include <climits>
+ #include <c10/cuda/CUDAException.h>
+ #include "flash.h"
+ #include "static_switch.h"
+ #include "d32_pad.h"
++#include "flash_fwd_tiles.h"
+ #include <c10/cuda/CUDAGuard.h>
+ #include <c10/cuda/CUDAStream.h>
+ 
+@@ -234,10 +237,183 @@
+ }
+ 
+ 
++// ---------------------------------------------------------------------------------------------
++// V2.3.2 forward tile selection.
++// SMALLM=1 compiles M64 (4 warps), SMALLM=2 also compiles M32 (2 warps).
++// D96_M64_N128 adds a separate D96 / M64 / N128 experiment (tile id 65).
++// Automatic shape profiles are deliberately gated to the exact fixed-length CMP 40HX
++// benchmark profiles (34 SMs, B1H4 and B2H8). Unmeasured shapes use the generic wave model.
++// Mode 0 = automatic; 128/64/32 force M; 65 forces D96 M64 N128 only.
++// ---------------------------------------------------------------------------------------------
++#ifdef FLASH_TURING_SMALLM
++static constexpr int kFwdTileCompiled = FLASH_TURING_SMALLM;
++#else
++static constexpr int kFwdTileCompiled = 0;
++#endif
++#ifdef FLASH_TURING_D96_M64_N128
++static constexpr int kFwdTileD96M64N128Compiled = 1;
++#else
++static constexpr int kFwdTileD96M64N128Compiled = 0;
++#endif
++static std::atomic<int> g_fwd_tile_mode{0};
++// Kept for unprofiled shapes only. The CMP 40HX profiles below are empirical choices.
++static std::atomic<int> g_fwd_tile_fixed_cost{48};
++
++static inline int device_sm_count() {
++    static std::atomic<int> cache[16];
++    int dev = 0;
++    C10_CUDA_CHECK(cudaGetDevice(&dev));
++    if (dev >= 0 && dev < 16) {
++        const int cached = cache[dev].load(std::memory_order_relaxed);
++        if (cached > 0) return cached;
++    }
++    int sms = 0;
++    C10_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
++    if (sms <= 0) sms = 1;
++    if (dev >= 0 && dev < 16) cache[dev].store(sms, std::memory_order_relaxed);
++    return sms;
++}
++
++static inline int plan_fwd_tile_wave_model(const int b, const int seqlen_q,
++                                            const int h, const int sms) {
++    if (kFwdTileCompiled <= 0) return 128;
++    const long long safe_sms = sms > 0 ? sms : 1;
++    const long long bh = static_cast<long long>(b) * static_cast<long long>(h);
++    const long long fixed = g_fwd_tile_fixed_cost.load(std::memory_order_relaxed);
++    int best = 128;
++    long long best_cost = LLONG_MAX;
++    const int candidates[3] = {128, 64, 32};
++    for (int t : candidates) {
++        if (t == 64 && kFwdTileCompiled < 1) continue;
++        if (t == 32 && kFwdTileCompiled < 2) continue;
++        const long long ctas = ((static_cast<long long>(seqlen_q) + t - 1) / t) * bh;
++        const long long waves = (ctas + safe_sms - 1) / safe_sms;
++        const long long cost = waves * (t + fixed);
++        if (cost < best_cost) { best_cost = cost; best = t; }
++    }
++    return best;
++}
++
++// Empirical policy from the full M128/M64/M32 sweep on CMP 40HX (34 SMs).
++// Returns -1 outside the exact shapes that were measured. Causal and non-causal
++// are separate because D96/D128 and D32 show material causal-dependent winners.
++static inline int plan_fwd_tile_cmp40hx_profile(const int b, const int h,
++                                                 const int d, const int s,
++                                                 const bool causal) {
++    if (b == 1 && h == 4 && (s == 128 || s == 256 || s == 512)) {
++        switch (d) {
++            case 32: return s <= 256 ? 32 : 64;
++            case 64: return 64;
++            case 96: return (!causal && s <= 256) ? 32 : 64;
++            case 128: return (!causal && s == 128) ? 32 : 64;
++            default: return -1;
++        }
++    }
++    if (b == 2 && h == 8 && (s == 128 || s == 256 || s == 512 || s == 1024)) {
++        if (s == 128) return 64;
++        switch (d) {
++            case 32: return (s == 256 && !causal) ? 128 : 64;
++            case 64:
++            case 96: return 128;
++            case 128: return (causal && s >= 512) ? 64 : 128;
++            default: return -1;
++        }
++    }
++    return -1;
++}
++
++static inline int plan_fwd_tile_for_params(const Flash_fwd_params &params) {
++    const int mode = g_fwd_tile_mode.load(std::memory_order_relaxed);
++    if (mode != 0) return mode;
++    if (kFwdTileCompiled <= 0) return 128;
++
++    const int sms = device_sm_count();
++    const bool fixed_full_sequence = params.cu_seqlens_q == nullptr &&
++                                     params.cu_seqlens_k == nullptr &&
++                                     params.seqlen_q == params.seqlen_k;
++    if (sms == 34 && fixed_full_sequence) {
++        const int profiled = plan_fwd_tile_cmp40hx_profile(
++            params.b, params.h, params.d, params.seqlen_q, params.is_causal);
++        if (profiled > 0) {
++            if (profiled == 32 && kFwdTileCompiled < 2) return 64;
++            if (profiled == 64 && kFwdTileCompiled < 1) return 128;
++            return profiled;
++        }
++    }
++    return plan_fwd_tile_wave_model(params.b, params.seqlen_q, params.h, sms);
++}
++
++static inline int plan_fwd_tile_shape(const int b, const int seqlen_q,
++                                       const int h, const int d, const bool causal) {
++    Flash_fwd_params params{};
++    params.b = b;
++    params.seqlen_q = seqlen_q;
++    params.seqlen_k = seqlen_q;
++    params.h = h;
++    params.d = d;
++    params.is_causal = causal;
++    return plan_fwd_tile_for_params(params);
++}
++
++// Compatibility API retained for callers that only know B/S/H. It uses the generic model.
++static inline int plan_fwd_tile(const int b, const int seqlen_q, const int h) {
++    const int mode = g_fwd_tile_mode.load(std::memory_order_relaxed);
++    if (mode != 0) return mode;
++    return plan_fwd_tile_wave_model(b, seqlen_q, h, device_sm_count());
++}
++
++static void set_fwd_tile_mode(const int mode) {
++    TORCH_CHECK(mode == 0 || mode == 128 || mode == 64 || mode == 32 || mode == 65,
++                "fwd tile mode must be 0 (auto), 128, 64, 32, or 65 (D96 M64 N128)");
++    TORCH_CHECK(mode != 64 || kFwdTileCompiled >= 1,
++                "kBlockM=64 kernels were not compiled (build with FLASH_TURING_SMALLM=1 or 2)");
++    TORCH_CHECK(mode != 32 || kFwdTileCompiled >= 2,
++                "kBlockM=32 kernels were not compiled (build with FLASH_TURING_SMALLM=2)");
++    TORCH_CHECK(mode != 65 || (kFwdTileCompiled >= 1 && kFwdTileD96M64N128Compiled),
++                "D96 M64 N128 kernel was not compiled (set FLASH_TURING_D96_M64_N128=1)");
++    g_fwd_tile_mode.store(mode, std::memory_order_relaxed);
++}
++
++static void set_fwd_tile_fixed_cost(const int cost) {
++    TORCH_CHECK(cost >= 0 && cost <= 4096, "fixed cost must be in [0, 4096]");
++    g_fwd_tile_fixed_cost.store(cost, std::memory_order_relaxed);
++}
++
++// Keep preprocessor conditionals outside HEADDIM_SWITCH / BOOL_SWITCH macro arguments.
++template <int Headdim, bool Is_causal>
++static inline void dispatch_mha_fwd_tile(Flash_fwd_params &params, const int tile) {
++#if defined(FLASH_TURING_D96_M64_N128)
++    if (tile == 65) {
++        if constexpr (Headdim == 96) {
++            run_mha_fwd_tile_<96, Is_causal, 64, 128>(params);
++            return;
++        } else {
++            TORCH_CHECK(false, "tile mode 65 is only valid for head dimension 96");
++            return;
++        }
++    }
++#endif
++    (void)tile;
++#ifdef FLASH_TURING_SMALLM
++    if (tile == 64) {
++        run_mha_fwd_tile_<Headdim, Is_causal, 64>(params);
++        return;
++    }
++#if FLASH_TURING_SMALLM >= 2
++    if (tile == 32) {
++        run_mha_fwd_tile_<Headdim, Is_causal, 32>(params);
++        return;
++    }
++#endif
++#endif
++    run_mha_fwd_<Headdim, Is_causal>(params);
++}
++
+ void run_mha_fwd(Flash_fwd_params &params){
++    const int tile = plan_fwd_tile_for_params(params);
+     HEADDIM_SWITCH(params.d, [&] {
+         BOOL_SWITCH(params.is_causal, Is_causal, [&] {
+-                run_mha_fwd_<kHeadDim, Is_causal>(params);
++            dispatch_mha_fwd_tile<kHeadDim, Is_causal>(params, tile);
+         });
+     });
+ }
+@@ -790,4 +966,22 @@
+     m.def("bwd", &mha_bwd, "Backward pass");
+     m.def("varlen_fwd", &mha_varlen_fwd, "Varlen forward pass");
+     m.def("varlen_bwd", &mha_varlen_bwd, "Varlen backward pass");
+-}
++    // V2.3 forward tile control (no effect unless built with FLASH_TURING_SMALLM >= 1)
++    m.def("set_fwd_tile_mode", &set_fwd_tile_mode, pybind11::arg("mode"),
++          "0 = auto, 128/64/32 = force kBlockM; 65 = force D96 M64 N128");
++    m.def("get_fwd_tile_mode", []() { return g_fwd_tile_mode.load(std::memory_order_relaxed); });
++    m.def("set_fwd_tile_fixed_cost", &set_fwd_tile_fixed_cost, pybind11::arg("cost"),
++          "Fixed per-row-block cost (in rows) used by the automatic tile model; default 48");
++    m.def("fwd_tile_support", []() { return kFwdTileCompiled; },
++          "0: only kBlockM=128; 1: also 64; 2: also 32");
++    m.def("fwd_tile_n128_support", []() { return kFwdTileD96M64N128Compiled; },
++          "1 when the experimental D96/M64/N128 variants are compiled");
++    m.def("plan_fwd_tile", [](int batch, int seqlen_q, int heads) { return plan_fwd_tile(batch, seqlen_q, heads); },
++          pybind11::arg("batch"), pybind11::arg("seqlen_q"), pybind11::arg("heads"),
++          "Legacy B/S/H generic wave-model estimate");
++    m.def("plan_fwd_tile_for_shape", [](int batch, int seqlen_q, int heads, int head_dim, bool causal) {
++              return plan_fwd_tile_shape(batch, seqlen_q, heads, head_dim, causal);
++          }, pybind11::arg("batch"), pybind11::arg("seqlen_q"), pybind11::arg("heads"),
++             pybind11::arg("head_dim"), pybind11::arg("causal"),
++          "Shape-aware auto dispatch estimate; exact CMP40HX profiles or generic fallback");
++}
+--- /dev/null
++++ b/csrc/flash_attn/src/flash_fwd_hdim128_fp16_m32_causal_sm75.cu
+@@ -0,0 +1,10 @@
++#include "flash_fwd_launch_template.h"
++
++#include <cutlass/numeric_types.h>
++
++using half_t = cutlass::half_t;
++
++template<>
++void run_mha_fwd_tile_<128, true, 32>(Flash_fwd_params &params) {
++    run_mha_fwd_tile_impl<128, 32, 2, true>(params);
++}
+--- /dev/null
++++ b/csrc/flash_attn/src/flash_fwd_hdim128_fp16_m32_sm75.cu
+@@ -0,0 +1,10 @@
++#include "flash_fwd_launch_template.h"
++
++#include <cutlass/numeric_types.h>
++
++using half_t = cutlass::half_t;
++
++template<>
++void run_mha_fwd_tile_<128, false, 32>(Flash_fwd_params &params) {
++    run_mha_fwd_tile_impl<128, 32, 2, false>(params);
++}
+--- /dev/null
++++ b/csrc/flash_attn/src/flash_fwd_hdim128_fp16_m64_causal_sm75.cu
+@@ -0,0 +1,10 @@
++#include "flash_fwd_launch_template.h"
++
++#include <cutlass/numeric_types.h>
++
++using half_t = cutlass::half_t;
++
++template<>
++void run_mha_fwd_tile_<128, true, 64>(Flash_fwd_params &params) {
++    run_mha_fwd_tile_impl<128, 64, 4, true>(params);
++}
+--- /dev/null
++++ b/csrc/flash_attn/src/flash_fwd_hdim128_fp16_m64_sm75.cu
+@@ -0,0 +1,10 @@
++#include "flash_fwd_launch_template.h"
++
++#include <cutlass/numeric_types.h>
++
++using half_t = cutlass::half_t;
++
++template<>
++void run_mha_fwd_tile_<128, false, 64>(Flash_fwd_params &params) {
++    run_mha_fwd_tile_impl<128, 64, 4, false>(params);
++}
+--- /dev/null
++++ b/csrc/flash_attn/src/flash_fwd_hdim32_fp16_m32_causal_sm75.cu
+@@ -0,0 +1,10 @@
++#include "flash_fwd_launch_template.h"
++
++#include <cutlass/numeric_types.h>
++
++using half_t = cutlass::half_t;
++
++template<>
++void run_mha_fwd_tile_<32, true, 32>(Flash_fwd_params &params) {
++    run_mha_fwd_tile_impl<32, 32, 2, true>(params);
++}
+--- /dev/null
++++ b/csrc/flash_attn/src/flash_fwd_hdim32_fp16_m32_sm75.cu
+@@ -0,0 +1,10 @@
++#include "flash_fwd_launch_template.h"
++
++#include <cutlass/numeric_types.h>
++
++using half_t = cutlass::half_t;
++
++template<>
++void run_mha_fwd_tile_<32, false, 32>(Flash_fwd_params &params) {
++    run_mha_fwd_tile_impl<32, 32, 2, false>(params);
++}
+--- /dev/null
++++ b/csrc/flash_attn/src/flash_fwd_hdim32_fp16_m64_causal_sm75.cu
+@@ -0,0 +1,10 @@
++#include "flash_fwd_launch_template.h"
++
++#include <cutlass/numeric_types.h>
++
++using half_t = cutlass::half_t;
++
++template<>
++void run_mha_fwd_tile_<32, true, 64>(Flash_fwd_params &params) {
++    run_mha_fwd_tile_impl<32, 64, 4, true>(params);
++}
+--- /dev/null
++++ b/csrc/flash_attn/src/flash_fwd_hdim32_fp16_m64_sm75.cu
+@@ -0,0 +1,10 @@
++#include "flash_fwd_launch_template.h"
++
++#include <cutlass/numeric_types.h>
++
++using half_t = cutlass::half_t;
++
++template<>
++void run_mha_fwd_tile_<32, false, 64>(Flash_fwd_params &params) {
++    run_mha_fwd_tile_impl<32, 64, 4, false>(params);
++}
+--- /dev/null
++++ b/csrc/flash_attn/src/flash_fwd_hdim64_fp16_m32_causal_sm75.cu
+@@ -0,0 +1,10 @@
++#include "flash_fwd_launch_template.h"
++
++#include <cutlass/numeric_types.h>
++
++using half_t = cutlass::half_t;
++
++template<>
++void run_mha_fwd_tile_<64, true, 32>(Flash_fwd_params &params) {
++    run_mha_fwd_tile_impl<64, 32, 2, true>(params);
++}
+--- /dev/null
++++ b/csrc/flash_attn/src/flash_fwd_hdim64_fp16_m32_sm75.cu
+@@ -0,0 +1,10 @@
++#include "flash_fwd_launch_template.h"
++
++#include <cutlass/numeric_types.h>
++
++using half_t = cutlass::half_t;
++
++template<>
++void run_mha_fwd_tile_<64, false, 32>(Flash_fwd_params &params) {
++    run_mha_fwd_tile_impl<64, 32, 2, false>(params);
++}
+--- /dev/null
++++ b/csrc/flash_attn/src/flash_fwd_hdim64_fp16_m64_causal_sm75.cu
+@@ -0,0 +1,10 @@
++#include "flash_fwd_launch_template.h"
++
++#include <cutlass/numeric_types.h>
++
++using half_t = cutlass::half_t;
++
++template<>
++void run_mha_fwd_tile_<64, true, 64>(Flash_fwd_params &params) {
++    run_mha_fwd_tile_impl<64, 64, 4, true>(params);
++}
+--- /dev/null
++++ b/csrc/flash_attn/src/flash_fwd_hdim64_fp16_m64_sm75.cu
+@@ -0,0 +1,10 @@
++#include "flash_fwd_launch_template.h"
++
++#include <cutlass/numeric_types.h>
++
++using half_t = cutlass::half_t;
++
++template<>
++void run_mha_fwd_tile_<64, false, 64>(Flash_fwd_params &params) {
++    run_mha_fwd_tile_impl<64, 64, 4, false>(params);
++}
+--- /dev/null
++++ b/csrc/flash_attn/src/flash_fwd_hdim96_fp16_m32_causal_sm75.cu
+@@ -0,0 +1,10 @@
++#include "flash_fwd_launch_template.h"
++
++#include <cutlass/numeric_types.h>
++
++using half_t = cutlass::half_t;
++
++template<>
++void run_mha_fwd_tile_<96, true, 32>(Flash_fwd_params &params) {
++    run_mha_fwd_tile_impl<96, 32, 2, true>(params);
++}
+--- /dev/null
++++ b/csrc/flash_attn/src/flash_fwd_hdim96_fp16_m32_sm75.cu
+@@ -0,0 +1,10 @@
++#include "flash_fwd_launch_template.h"
++
++#include <cutlass/numeric_types.h>
++
++using half_t = cutlass::half_t;
++
++template<>
++void run_mha_fwd_tile_<96, false, 32>(Flash_fwd_params &params) {
++    run_mha_fwd_tile_impl<96, 32, 2, false>(params);
++}
+--- /dev/null
++++ b/csrc/flash_attn/src/flash_fwd_hdim96_fp16_m64_causal_sm75.cu
+@@ -0,0 +1,10 @@
++#include "flash_fwd_launch_template.h"
++
++#include <cutlass/numeric_types.h>
++
++using half_t = cutlass::half_t;
++
++template<>
++void run_mha_fwd_tile_<96, true, 64>(Flash_fwd_params &params) {
++    run_mha_fwd_tile_impl<96, 64, 4, true>(params);
++}
+--- /dev/null
++++ b/csrc/flash_attn/src/flash_fwd_hdim96_fp16_m64_n128_causal_sm75.cu
+@@ -0,0 +1,10 @@
++#include "flash_fwd_launch_template.h"
++
++#include <cutlass/numeric_types.h>
++
++using half_t = cutlass::half_t;
++
++template<>
++void run_mha_fwd_tile_<96, true, 64, 128>(Flash_fwd_params &params) {
++    run_mha_fwd_tile_impl_n<96, 64, 128, 4, true>(params);
++}
+--- /dev/null
++++ b/csrc/flash_attn/src/flash_fwd_hdim96_fp16_m64_n128_sm75.cu
+@@ -0,0 +1,10 @@
++#include "flash_fwd_launch_template.h"
++
++#include <cutlass/numeric_types.h>
++
++using half_t = cutlass::half_t;
++
++template<>
++void run_mha_fwd_tile_<96, false, 64, 128>(Flash_fwd_params &params) {
++    run_mha_fwd_tile_impl_n<96, 64, 128, 4, false>(params);
++}
+--- /dev/null
++++ b/csrc/flash_attn/src/flash_fwd_hdim96_fp16_m64_sm75.cu
+@@ -0,0 +1,10 @@
++#include "flash_fwd_launch_template.h"
++
++#include <cutlass/numeric_types.h>
++
++using half_t = cutlass::half_t;
++
++template<>
++void run_mha_fwd_tile_<96, false, 64>(Flash_fwd_params &params) {
++    run_mha_fwd_tile_impl<96, 64, 4, false>(params);
++}
+--- a/csrc/flash_attn/src/flash_fwd_kernel.h
++++ b/csrc/flash_attn/src/flash_fwd_kernel.h
+@@ -745,7 +745,14 @@
+                                       int head_dim,
+                                       float softmax_scale,
+                                       int is_casual) {
++#ifdef FLASH_TURING_CAUSAL_REVERSE
++    // V2.3: causal row blocks near the bottom do the most work; launch them first so the
++    // light blocks fill the tail of the last wave. Every CTA is independent, so only the
++    // schedule changes, not the result.
++    const int m_block = Is_causal ? (int(gridDim.x) - 1 - int(blockIdx.x)) : int(blockIdx.x);
++#else
+     const int m_block = blockIdx.x;
++#endif
+     // The block index for the batch.
+     const int bidb = blockIdx.y;
+     // The block index for the head.
+--- a/csrc/flash_attn/src/flash_fwd_launch_template.h
++++ b/csrc/flash_attn/src/flash_fwd_launch_template.h
+@@ -6,11 +6,12 @@
+ #include "flash_fwd_kernel.h"
+ #include <cutlass/numeric_types.h>
+ #include "static_switch.h"
++#include "flash_fwd_tiles.h"
+ #include <atomic>
+ using half_t = cutlass::half_t;
+ 
+ template <typename Kernel_traits, bool Is_causal, bool Is_even_MN>
+-__global__ __launch_bounds__(256)
++__global__ __launch_bounds__(Kernel_traits::kNThreads)
+ // for some reason changing this into params struc is 10% slower for hdim = 128
+ void flash_fwd_kernel(half_t* __restrict__ q,
+                           half_t* __restrict__ k,
+@@ -65,7 +66,7 @@
+                              params.seqlen_k % kBlockN == 0;
+ 
+     dim3 dimGrid(num_m_block, params.b, params.h);
+-    dim3 dimBlock(256);
++    dim3 dimBlock(Kernel_traits::kNThreads);
+ 
+     // Exact dynamic smem: sQ (kBlockM x D) + sK (kBlockN x D) [+ sV (kBlockN x D) with SEPV].
+     // (V1 always requested 64 KB, which pinned occupancy at 1 CTA/SM even for small tiles.)
+@@ -113,6 +114,20 @@
+ 
+ 
+ 
++// V2.3: smaller-M variants (kBlockM = 16 * kNWarps) of the same kernel, for grids that would
++// otherwise leave most SMs idle. Instantiated from flash_fwd_hdim<D>_fp16_m<M>[_causal]_sm75.cu.
++template<int Headdim, int kBlockM, int kBlockN, int kNWarps, bool Is_causal>
++void run_mha_fwd_tile_impl_n(Flash_fwd_params &params) {
++    run_flash_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, kNWarps>, Is_causal>(params);
++}
++
++template<int Headdim, int kBlockM, int kNWarps, bool Is_causal>
++void run_mha_fwd_tile_impl(Flash_fwd_params &params) {
++    constexpr static int kBlockN = Fwd_tile_n<Headdim>::value;
++    run_mha_fwd_tile_impl_n<Headdim, kBlockM, kBlockN, kNWarps, Is_causal>(params);
++}
++
++
+ template<bool Is_causal>
+ void run_mha_fwd_hdim32(Flash_fwd_params &params) {
+     constexpr static int Headdim = 32;
+--- /dev/null
++++ b/csrc/flash_attn/src/flash_fwd_tiles.h
+@@ -0,0 +1,21 @@
++#pragma once
++// V2.3 forward-tile selection support (see README_V23.md).
++//
++// The V2/V2.2 forward kernels always use kBlockM = 128 (8 warps x 16 rows). With the
++// shapes that matter for short-sequence inference (B*H small, S <= 512) that launches only
++// ceil(S/128) * B * H CTAs, far fewer than the SM count, so most SMs sit idle.
++// V2.3 additionally compiles kBlockM = 64 (4 warps) and kBlockM = 32 (2 warps) variants
++// of the SAME kernel body; the host picks one per launch.
++#include "flash.h"
++
++// kBlockN used by the existing 128-row kernels, kept for the smaller-M variants.
++template <int Headdim>
++struct Fwd_tile_n {
++    static constexpr int value = (Headdim == 96 || Headdim == 128) ? 64 : 128;
++};
++
++// Explicitly specialised in flash_fwd_hdim<D>_fp16_m<M>[_causal]_sm75.cu.
++// kBlockM is the number of query rows per CTA (64 or 32).
++template <int Headdim, bool Is_causal, int kBlockM,
++          int kBlockN = Fwd_tile_n<Headdim>::value>
++void run_mha_fwd_tile_(Flash_fwd_params &params);
+--- a/csrc/flash_attn/src/kernel_traits.h
++++ b/csrc/flash_attn/src/kernel_traits.h
+@@ -59,12 +59,18 @@
+     static constexpr int kBlockM = kBlockM_;
+     static constexpr int kBlockN = kBlockN_;
+     static constexpr int kHeadDim = kHeadDim_;
++    // V2.3: the forward tile is parameterised on the warp count. Every warp owns
++    // exactly 16 query rows, so kBlockM must equal 16 * kNWarps. kNWarps == 8
++    // (kBlockM == 128) produces exactly the same types as V2/V2.2.
++    static constexpr int kNWarps = kNWarps_;
++    static constexpr int kNThreads = kNWarps_ * 32;
++    static_assert(kBlockM_ == 16 * kNWarps_, "forward kernel: each warp must own exactly 16 query rows");
+ 
+     using TiledMma = TiledMMA<
+         typename Base::MMA_Atom_Arch,
+-        Layout<Shape<_8,_1,_1>>,
++        Layout<Shape<Int<kNWarps_>,_1,_1>>,
+         // LDSM loads 32 rows for K and V
+-        Tile<_128, _32, _8>>;
++        Tile<Int<16 * kNWarps_>, _32, _8>>;
+ 
+     using SmemLayoutAtomQK = std::conditional_t<
+         (kHeadDim == 96 || kHeadDim == 32),
+@@ -107,20 +113,20 @@
+ 
+     using GmemLayoutAtomQK = std::conditional_t<
+         (kHeadDim == 96 || kHeadDim == 32),
+-        Layout<Shape<_64, _4>, Stride<_4, _1>>,
+-        Layout<Shape<_32, _8>, Stride<_8, _1>>>;
++        Layout<Shape<Int<kNThreads / 4>, _4>, Stride<_4, _1>>,
++        Layout<Shape<Int<kNThreads / 8>, _8>, Stride<_8, _1>>>;
+ 
+     // using GmemLayoutAtomV = Layout<Shape <_8, _32>, Stride<_1, _8>>;
+     using GmemLayoutAtomV = std::conditional_t<
+         (kHeadDim == 96 || kHeadDim == 32),
+-        Layout<Shape<_64, _4>, Stride<_4, _1>>,
+-        Layout<Shape<_32, _8>, Stride<_8, _1>>>;
++        Layout<Shape<Int<kNThreads / 4>, _4>, Stride<_4, _1>>,
++        Layout<Shape<Int<kNThreads / 8>, _8>, Stride<_8, _1>>>;
+ 
+ 
+     using GmemLayoutAtomO = std::conditional_t<
+         (kHeadDim == 96 || kHeadDim == 32),
+-        Layout<Shape<_64, _4>, Stride<_4, _1>>,
+-        Layout<Shape<_32, _8>, Stride<_8, _1>>>;
++        Layout<Shape<Int<kNThreads / 4>, _4>, Stride<_4, _1>>,
++        Layout<Shape<Int<kNThreads / 8>, _8>, Stride<_8, _1>>>;
+ 
+ 
+     using GmemTiledCopyQK = decltype(
+--- a/setup.py
++++ b/setup.py
+@@ -37,6 +37,37 @@
+     v2_macros.append(("FLASH_TURING_SEPV", "1"))
+ if os.environ.get("FLASH_TURING_FASTSM", "0") == "1":
+     v2_macros.append(("FLASH_TURING_FASTSM", "1"))
++# V2.3 forward tile variants (opt-in; default = V2/V2.2 kernels only)
++#   set FLASH_TURING_SMALLM=1   also compile kBlockM=64 (4 warps) forward kernels
++#   set FLASH_TURING_SMALLM=2   also compile kBlockM=32 (2 warps) forward kernels
++#   set FLASH_TURING_CAUSAL_REVERSE=0   disable heavy-first causal CTA order (default on when SMALLM is set)
++smallm = os.environ.get("FLASH_TURING_SMALLM", "0")
++if smallm not in ("0", "1", "2"):
++    raise SystemExit("FLASH_TURING_SMALLM must be 0, 1 or 2")
++if smallm != "0":
++    v2_macros.append(("FLASH_TURING_SMALLM", smallm))
++    if os.environ.get("FLASH_TURING_CAUSAL_REVERSE", "1") == "1":
++        v2_macros.append(("FLASH_TURING_CAUSAL_REVERSE", "1"))
++d96_m64_n128 = os.environ.get("FLASH_TURING_D96_M64_N128", "0") == "1"
++if d96_m64_n128 and smallm == "0":
++    raise SystemExit("FLASH_TURING_D96_M64_N128=1 requires FLASH_TURING_SMALLM=1 or 2")
++if d96_m64_n128:
++    v2_macros.append(("FLASH_TURING_D96_M64_N128", "1"))
++smallm_sources = []
++for _m in ([64] if smallm == "1" else [64, 32] if smallm == "2" else []):
++    for _d in (32, 64, 96, 128):
++        # D32 tiles need the native-D32 build; the padded fallback launches the D64 tiles.
++        if _d == 32 and not native_d32:
++            continue
++        for _c in ("", "_causal"):
++            smallm_sources.append(f"csrc/flash_attn/src/flash_fwd_hdim{_d}_fp16_m{_m}{_c}_sm75.cu")
++
++if d96_m64_n128:
++    smallm_sources.extend([
++        "csrc/flash_attn/src/flash_fwd_hdim96_fp16_m64_n128_sm75.cu",
++        "csrc/flash_attn/src/flash_fwd_hdim96_fp16_m64_n128_causal_sm75.cu",
++    ])
++
+ native_d32_sources = [
+     "csrc/flash_attn/src/flash_fwd_hdim32_fp16_sm75.cu",
+     "csrc/flash_attn/src/flash_fwd_hdim32_fp16_causal_sm75.cu",
+@@ -63,7 +94,7 @@
+                      "csrc/flash_attn/src/flash_bwd_hdim96_fp16_causal_sm75.cu",
+                      "csrc/flash_attn/src/flash_bwd_hdim128_fp16_sm75.cu",
+                      "csrc/flash_attn/src/flash_bwd_hdim128_fp16_causal_sm75.cu"
+-                     ] + native_d32_sources,
++                     ] + native_d32_sources + smallm_sources,
+             define_macros=([("FLASH_TURING_NATIVE_D32", "1")] if native_d32 else []) + v2_macros,
+             include_dirs=[
+                 Path(this_dir) / "csrc" / "flash_attn",

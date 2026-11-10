@@ -1,0 +1,98 @@
+{
+  "name": "FlashAttention Turing V2.3.2 D-aware SmallTile + D96 M64 N128",
+  "version": "2.3.2-daware-d96-m64-n128",
+  "created": "2026-11-09",
+  "relationship": "additive SmallTile branch on V2.2 exact attention; distinct from Cascade-HRA V2.3 research package",
+  "target": {
+    "gpu": "NVIDIA CMP 40HX",
+    "architecture": "Turing SM75",
+    "sm_count": 34,
+    "dtype": "FP16"
+  },
+  "checkpoint_b": {
+    "profiles": [
+      "B=1,H=4,D={32,64,96,128},S={128,256,512},causal/non-causal",
+      "B=2,H=8,D={32,64,96,128},S={128,256,512,1024},causal/non-causal"
+    ],
+    "policy_scope": "exact benchmark profiles only; 34 SMs, fixed-length, Sq=Sk; all other shapes use generic wave/fixed-cost fallback",
+    "offline_regret_us": {
+      "B1H4": 0.02,
+      "B2H8": 0.0
+    },
+    "measurement_source": [
+      "v23_tiles_b1h4_full.log",
+      "v23_tiles_b2h8_full.log"
+    ],
+    "notes": "single submitted measurement session per cell; 0.02 us near-tie treated conservatively"
+  },
+  "checkpoint_c": {
+    "candidate": "D96 kBlockM=64 kBlockN=128, 4 warps",
+    "runtime_force_mode": 65,
+    "automatic_dispatch": "disabled until target GPU benchmark evidence",
+    "separate_causal_and_noncausal_instantiations": true,
+    "shared_memory_request_with_SEPV_bytes": 61440
+  },
+  "validation": {
+    "prior_user_supplied_all_head_dimensions_regression": "72/72 PASS on V2.3.1 baseline, per user log",
+    "selector_policy_offline_replay": "PASS; 56 profile cells matched measured winners except one 0.02 us near-tie conservatively kept at M64",
+    "python_syntax": "PASS",
+    "cpp_template_signature_smoke_gcc_cxx17": "PASS",
+    "apply_restore_fresh_v22_test": "PASS using hash-verified V2+V2.2 inputs and rollback",
+    "v23_1_upgrade_restore_test": "PASS using synthetic manifested worktree; transactional paths verified",
+    "lf_patch_application_test": "PASS; on CRLF Windows source use the hash-checked scripts, not raw patch",
+    "v2_3_2_nvcc_build_on_cmp_40hx": "NOT RUN",
+    "v2_3_2_tile_fp32_correctness_on_cmp_40hx": "NOT RUN",
+    "d96_m64_n128_gpu_benchmark": "NOT RUN",
+    "production_ready": false
+  },
+  "files": {
+    "CHECKPOINT_B_C_REPORT.md": "8776459c25d5eaf1d17eb43475230ef3604589aff4dd1c5aee57f7e8bf7fc8a8",
+    "HOTFIX_NOTES.md": "be20548084192f6b4521c89f3738decb9976eed2c5e8e24090ada47e4b9c28ac",
+    "README_V23.md": "45ee5db62edccbcfb6999e38c9155e14a05a7c1539e9829f59d3484a5ae98010",
+    "RUN_V23_2_UPGRADE.bat": "d0ad7b996a4210a389ef52961716c7040556ab99f5bdcf14080d9ff5cff57f59",
+    "RUN_V23_APPLY.bat": "bbcb665acdf89a1608b2ded415adb914d91e59273a1da96cfdc7d553d908c507",
+    "RUN_V23_BUILD.bat": "be35bc681714bf8e129b1600820eb7b99511d7cdcbef7f2935a9a8a34e998de2",
+    "RUN_V23_DISPATCH_HOTFIX.bat": "237d1104b13df4bd8276afbc4fba37fbfc35934eb3f2285874899a8b32a83343",
+    "RUN_V23_RESTORE.bat": "ea873c9eb47a61a94a8c7f49575344c63963975b7344ee439f225aff64b2f8b9",
+    "RUN_V23_TESTS.bat": "e2a028361b4885100617a326c083a4032772381a7121378b90ec84018ca6b27e",
+    "RUN_V23_TUNE.bat": "f3c45fda7c3588420561ad80d83b147a8831e5bb8bc5434fd8f34b8a87b5c9f0",
+    "V22_to_V23.1.patch": "ae0d7504ec2ab846f78360864afe440880e287bd8a70908aab6991ee2fb3e7b8",
+    "V22_to_V23.2.patch": "ba146056ab13ca60bd02456ab8ea4b36b63af0817dcaabd194bc3b096cccd556",
+    "V22_to_V23.patch": "c6310ddcd530892e933352f2d9944397c80e13ca7232c6d3df1653f2f0ff3102",
+    "V23.1_to_V23.2.patch": "920f5098f0abf069f88a5d599ca495e1e1bdc39ec24e8b2727ff74a28175d6d7",
+    "apply_v23_2_upgrade.py": "fcf8a0993c17753a20cd2149384e35337184dab6e66d3beaac9566117b909735",
+    "apply_v23_dispatch_hotfix.py": "ef5520d966c6b5b2623580ffc5bf32d837e96529c12a94dc5cf3892c45ce959f",
+    "apply_v23_overlay.py": "6ca73532a8af882d5c0c9f18b5cad630d0c79f6c854cb360e33111a0e4f9bc79",
+    "restore_v23_overlay.py": "10e5af32451721c6da71044ef779713a2491e30db3b315a6527065821af8ef53",
+    "source_overlay_v23/csrc/flash_attn/flash_api.cpp": "7a21e1b94d1688fcd0959e063ef7ad2b7d0bfdb214c50b9aa43ebaeca3a00fde",
+    "source_overlay_v23/csrc/flash_attn/src/flash_fwd_hdim128_fp16_m32_causal_sm75.cu": "7a2237f7658f1da1591df7a92976c396603ff9986f9ba9f666aeb709bd61b340",
+    "source_overlay_v23/csrc/flash_attn/src/flash_fwd_hdim128_fp16_m32_sm75.cu": "436b3ffaba0f5f90311ca6b4dc36a8b47a3cda6277116b9aa33ffcd9416df9f6",
+    "source_overlay_v23/csrc/flash_attn/src/flash_fwd_hdim128_fp16_m64_causal_sm75.cu": "d58c8d09cef8334953877b77f43aeb2ee15950be648e4a889ac55e4f23943136",
+    "source_overlay_v23/csrc/flash_attn/src/flash_fwd_hdim128_fp16_m64_sm75.cu": "b7646eaa37378ce6d03814e41165acd6ce91743db5839e3b04bc18936de578e2",
+    "source_overlay_v23/csrc/flash_attn/src/flash_fwd_hdim32_fp16_m32_causal_sm75.cu": "299de74848536ed6f381f8fba1af1ae24047aff099e4a8eb2c0f72bd90af5e59",
+    "source_overlay_v23/csrc/flash_attn/src/flash_fwd_hdim32_fp16_m32_sm75.cu": "76fd24a0801ab8576eeb74eb439427bd80e3927b2f9e21a4861f7cf13d2e2d5f",
+    "source_overlay_v23/csrc/flash_attn/src/flash_fwd_hdim32_fp16_m64_causal_sm75.cu": "88b147be0304a8b9a631c844882606f4b490d11d38e8d4f9ba73d819fb8e5e03",
+    "source_overlay_v23/csrc/flash_attn/src/flash_fwd_hdim32_fp16_m64_sm75.cu": "3fcff848a0a20e090bb2c52e696430efb19d7c32fae738b7bca67f8c3f5e1a8c",
+    "source_overlay_v23/csrc/flash_attn/src/flash_fwd_hdim64_fp16_m32_causal_sm75.cu": "816603f70fd6a0aa9b1c510f815293ba93875672554818058f48ce9f38c93ee4",
+    "source_overlay_v23/csrc/flash_attn/src/flash_fwd_hdim64_fp16_m32_sm75.cu": "a2a21c10112d24f5fe9d4c46137af384a691dc8412a971700f52f903b2f379c0",
+    "source_overlay_v23/csrc/flash_attn/src/flash_fwd_hdim64_fp16_m64_causal_sm75.cu": "b1026e00c0064ec8f473027bfb351878bc68f848e77d65ef3c1338269ad9576e",
+    "source_overlay_v23/csrc/flash_attn/src/flash_fwd_hdim64_fp16_m64_sm75.cu": "c17050a2256a8361ede3e464c3b475b06bf176228faf554db5f892ddb0249f19",
+    "source_overlay_v23/csrc/flash_attn/src/flash_fwd_hdim96_fp16_m32_causal_sm75.cu": "c5bd57a2b7a3f8a1bd1bda83dcd80eebc12e4e74a4727f1bab0da29f0ca7520a",
+    "source_overlay_v23/csrc/flash_attn/src/flash_fwd_hdim96_fp16_m32_sm75.cu": "2c7b59a3602564119e47f2e1c42c51d49ef18080a948963c3564569f3b47b799",
+    "source_overlay_v23/csrc/flash_attn/src/flash_fwd_hdim96_fp16_m64_causal_sm75.cu": "bd294c7b5678acdda6d7340d141618a8718eb85897257b035b17f93b6e6f9516",
+    "source_overlay_v23/csrc/flash_attn/src/flash_fwd_hdim96_fp16_m64_n128_causal_sm75.cu": "17666a3640e16b902d0895b968f5e329cac02d581082c4e175fce90de771c18b",
+    "source_overlay_v23/csrc/flash_attn/src/flash_fwd_hdim96_fp16_m64_n128_sm75.cu": "59dca8a8a6b4190d552cbf063d9c067a9bb1c6be84e2ab25d777ff3043ea1adc",
+    "source_overlay_v23/csrc/flash_attn/src/flash_fwd_hdim96_fp16_m64_sm75.cu": "29d8919a2f39555783ac13fa2e02f96a00decd5278cd72a4febd825d498c1e0d",
+    "source_overlay_v23/csrc/flash_attn/src/flash_fwd_kernel.h": "7da2293cecc291e700b92d563c038a62af5db57163b8621bea6851b224b247be",
+    "source_overlay_v23/csrc/flash_attn/src/flash_fwd_launch_template.h": "e66f98a3e0e3fa3ddef5e764f510ae299cb0e4bc4cb9f334518a1dedd3e02610",
+    "source_overlay_v23/csrc/flash_attn/src/flash_fwd_tiles.h": "ee9a5045763e992259c67e8b28cd028bafd23a7d62315fb6c211838e034c818d",
+    "source_overlay_v23/csrc/flash_attn/src/kernel_traits.h": "ee1f6f5369cbcb3f8f252cd450c3aa8e5d1263778947b447e9222fb51125bc20",
+    "source_overlay_v23/setup.py": "1b086d9cef6c74fde661ae18104f725629e66f6beb1afdff89f4288f954fec40",
+    "tools/bench_tiles_v23.py": "be507d4e31a988cf01a15fdde8e44d12371f7f93c8845d4a67c149e53ec4a077",
+    "validation/test_flashattn_all_head_dims_v1.py": "600c82795d1bc899107dec17963953f7610ae4836b7a8f955fe8558d4435c1bc",
+    "validation/test_flashattn_guardrails.py": "da77cf863feabdf9ca00751c5271560e81ed744b678b7899704c9cd7eac2a7ec",
+    "validation/test_v23_tiles.py": "74e8573165c012498e843f5cbadd6b72591fc6c8d810d6836775c8ebb6cfa0fb",
+    "SHA256SUMS.txt": "b0c6d058b7804727fb21399b42cbad7723160c78a06fb3266564c2455555a4b5"
+  },
+  "sha256_scope": "SHA256SUMS.txt covers every package file except itself and MANIFEST_V23.json; this manifest lists SHA256SUMS.txt and every other file, but not itself."
+}
